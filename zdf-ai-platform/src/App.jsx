@@ -49,35 +49,57 @@ const stripMarkdown = (text) => {
     .replace(/\[(.*?)\]\(.*?\)/g, '$1').replace(/\n{3,}/g, '\n\n').trim();
 };
 
-const callGemini = async (prompt, systemPrompt = "", files = []) => {
+/**
+ * 调用后端统一调度接口；`dispatch` 携带流水线角色与厂商/模型，便于多模型路由与测试。
+ * @param {string} prompt
+ * @param {string} systemPrompt
+ * @param {Array<{ name: string, type: string, isImage: boolean, data: string | null }>} files
+ * @param {{ roleId: string, vendor: string, model: string, mode: string, selfKey?: string } | null} [dispatch]
+ * @returns {Promise<string>}
+ */
+const callGemini = async (prompt, systemPrompt = "", files = [], dispatch = null) => {
   let retries = 0;
   const maxRetries = 3;
-  const payload = { prompt, systemPrompt, files: files.map(f => ({ name: f.name, type: f.type, isImage: f.isImage, data: f.data })) };
+  const payload = {
+    prompt,
+    systemPrompt,
+    files: files.map(f => ({ name: f.name, type: f.type, isImage: f.isImage, data: f.data })),
+    ...(dispatch ? { dispatch } : {}),
+  };
 
   const execute = async () => {
     const response = await fetch(`${API_BASE_URL}/ai/generate`, {
-      method: 'POST', 
-      headers: { 
+      method: 'POST',
+      headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${window.sessionStorage.getItem('token') || ''}`
+        Authorization: `Bearer ${window.sessionStorage.getItem('token') || ''}`,
       },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
     });
-    
+
     if (!response.ok) {
-      console.warn("未检测到后端 /ai/generate 接口，启用离线降级模拟...");
-      await new Promise(r => setTimeout(r, 1500));
-      return `[开发模拟回复] 您发送了：“${prompt}”。真实环境下该内容将由后端结合数据库中的 API Key 安全调度。`;
+      let errHint = '';
+      try {
+        const errJson = await response.json();
+        errHint = errJson.error || errJson.message || '';
+      } catch {
+        /* ignore */
+      }
+      console.warn('后端 /ai/generate 非成功状态，启用离线降级模拟...', response.status);
+      await new Promise(r => setTimeout(r, 800));
+      return `[开发模拟回复] ${errHint || `HTTP ${response.status}`}\n您发送了：“${prompt.slice(0, 400)}${prompt.length > 400 ? '…' : ''}”。请确认已启动 backend 且 Vite 代理 /api 指向正确端口。`;
     }
-    
+
     const data = await response.json();
-    return data.result || data.text || "无返回内容";
+    return data.result || data.text || '无返回内容';
   };
 
   while (retries < maxRetries) {
-    try { return await execute(); } 
-    catch (e) {
-      retries++; await new Promise(r => setTimeout(r, Math.pow(2, retries) * 500));
+    try {
+      return await execute();
+    } catch (e) {
+      retries++;
+      await new Promise(r => setTimeout(r, Math.pow(2, retries) * 500));
       if (retries === maxRetries) return `[错误] 后端调度失败: ${e.message}`;
     }
   }
@@ -260,17 +282,53 @@ const AdminApp = ({ auth, onLogout, dbUsers, setDbUsers, isTestMode, setIsTestMo
     setAdminKeys(prev => ({ ...prev, [vendorId]: { value, status: 'idle', msg: '' } }));
   };
 
+  /**
+   * 通过后端真实探测各厂商 Key（OpenAI 兼容 / Anthropic / Google 等）。
+   * @param {string} vendorId
+   */
   const handleTestKey = async (vendorId) => {
     const keyVal = adminKeys[vendorId]?.value || '';
-    if (!keyVal.trim()) return setAdminKeys(prev => ({ ...prev, [vendorId]: { ...prev[vendorId], status: 'error', msg: 'Key 不能为空' } }));
-    setAdminKeys(prev => ({ ...prev, [vendorId]: { ...prev[vendorId], status: 'testing', msg: '测试中...' } }));
-    await new Promise(r => setTimeout(r, 800));
-    if (keyVal.length < 8) {
-      setAdminKeys(prev => ({ ...prev, [vendorId]: { ...prev[vendorId], status: 'error', msg: '测试失败' } }));
-      addLog('warn', auth.username, 'API 测试失败', `供应商 ${vendorId} Key测试未通过`);
-    } else {
-      setAdminKeys(prev => ({ ...prev, [vendorId]: { ...prev[vendorId], status: 'success', msg: '测试通过' } }));
-      addLog('info', auth.username, 'API 测试成功', `供应商 ${vendorId} Key测试通过`);
+    if (!keyVal.trim()) {
+      return setAdminKeys((prev) => ({
+        ...prev,
+        [vendorId]: { ...prev[vendorId], status: 'error', msg: 'Key 不能为空' },
+      }));
+    }
+    setAdminKeys((prev) => ({
+      ...prev,
+      [vendorId]: { ...prev[vendorId], status: 'testing', msg: '测试中...' },
+    }));
+    try {
+      const res = await fetch(`${API_BASE_URL}/admin/test-key`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${window.sessionStorage.getItem('token') || ''}`,
+        },
+        body: JSON.stringify({ vendorId, key: keyVal }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (data.ok) {
+        setAdminKeys((prev) => ({
+          ...prev,
+          [vendorId]: { ...prev[vendorId], status: 'success', msg: '测试通过' },
+        }));
+        addLog('info', auth.username, 'API 测试成功', `供应商 ${vendorId} Key 校验通过`);
+      } else {
+        const msg = (data.msg || '测试失败').slice(0, 120);
+        setAdminKeys((prev) => ({
+          ...prev,
+          [vendorId]: { ...prev[vendorId], status: 'error', msg },
+        }));
+        addLog('warn', auth.username, 'API 测试失败', `供应商 ${vendorId}: ${msg}`);
+      }
+    } catch (e) {
+      const err = e instanceof Error ? e.message : String(e);
+      setAdminKeys((prev) => ({
+        ...prev,
+        [vendorId]: { ...prev[vendorId], status: 'error', msg: '网络或服务不可用' },
+      }));
+      addLog('warn', auth.username, 'API 测试失败', err);
     }
   };
 
@@ -650,32 +708,83 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, dbUsers 
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
+  /**
+   * 将当前角色面板上的厂商/模型打包给后端，用于多模型路由。
+   * @param {'A'|'B'|'C'|'D'} roleId
+   */
+  const buildDispatch = (roleId) => {
+    const c = configs[roleId];
+    return {
+      roleId,
+      vendor: c.vendor,
+      model: c.model,
+      mode: c.mode,
+      ...(c.mode === 'self' && c.key ? { selfKey: c.key } : {}),
+    };
+  };
+
   const runPipeline = async () => {
     if (!question.trim() && attachments.length === 0) return;
-    setIsRunning(true); setResultTab('final');
-    const newResults = { A: "", B: "", C: "", D: "", final: "" };
-    
+    setIsRunning(true);
+    setResultTab('final');
+    const newResults = { A: '', B: '', C: '', D: '', final: '' };
+
     try {
       setCurrentStep('A');
-      newResults.A = await callGemini(question, "直接回答用户问题。", attachments);
+      newResults.A = await callGemini(question, '直接回答用户问题。', attachments, buildDispatch('A'));
       setResults({ ...newResults });
 
       setCurrentStep('B');
-      newResults.B = await callGemini(`问题: ${question}\n初稿:\n${newResults.A}\n任务: 事实校核。`, "你是一个严格的事实校核员。", attachments);
+      newResults.B = await callGemini(
+        `问题: ${question}\n初稿:\n${newResults.A}\n任务: 事实校核。`,
+        '你是一个严格的事实校核员。',
+        attachments,
+        buildDispatch('B'),
+      );
       setResults({ ...newResults });
 
       setCurrentStep('C');
-      newResults.C = await callGemini(`校核稿:\n${newResults.B}\n任务: 润色。`, "你是一个专业的审核专家。", attachments);
+      newResults.C = await callGemini(
+        `校核稿:\n${newResults.B}\n任务: 润色。`,
+        '你是一个专业的审核专家。',
+        attachments,
+        buildDispatch('C'),
+      );
       setResults({ ...newResults });
 
       setCurrentStep('D');
-      const resD = await callGemini(`审核结果:\n${newResults.C}\n任务: 严格按照策略输出纯文本。`, "负责最终纯文本排版。", attachments);
-      newResults.D = stripMarkdown(resD); newResults.final = newResults.D;
-      
+      const resD = await callGemini(
+        `审核结果:\n${newResults.C}\n任务: 严格按照策略输出纯文本。`,
+        '负责最终纯文本排版。',
+        attachments,
+        buildDispatch('D'),
+      );
+      newResults.D = stripMarkdown(resD);
+      newResults.final = newResults.D;
+
       setResults({ ...newResults });
-      setHistory(prev => [{ id: Date.now(), question, answer: newResults.D, timestamp: new Date().toLocaleTimeString(), strategyName: STRATEGIES.find(s=>s.id===strategy).name }, ...prev]);
-    } catch (err) { console.error(err); } 
-    finally { setIsRunning(false); setCurrentStep(null); }
+      const histEntry = {
+        id: Date.now(),
+        question,
+        answer: newResults.D,
+        timestamp: new Date().toLocaleTimeString(),
+        strategyName: STRATEGIES.find((s) => s.id === strategy).name,
+      };
+      setHistory((prev) => [histEntry, ...prev]);
+      fetch(`${API_BASE_URL}/user/history`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${window.sessionStorage.getItem('token') || ''}`,
+        },
+        body: JSON.stringify({ entry: histEntry }),
+      }).catch(() => console.warn('写入服务端历史失败'));
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setIsRunning(false);
+      setCurrentStep(null);
+    }
   };
 
   const handleAdminAuth = () => {
