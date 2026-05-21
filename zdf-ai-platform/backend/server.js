@@ -121,9 +121,10 @@ function resolveApiModel(vendor, model) {
     return 'claude-3-5-sonnet-20241022';
   }
   if (vendor === 'google') {
-    if (/2\.5|2_5/i.test(m)) return 'gemini-2.0-flash';
-    if (/1\.5-pro/i.test(m)) return 'gemini-1.5-pro';
-    return 'gemini-1.5-flash';
+    if (/2\.5|2_5/i.test(m)) return 'gemini-2.5-flash-preview-05-20';
+    if (/1\.5-pro/i.test(m)) return 'gemini-1.5-pro-latest';
+    if (/1\.5/i.test(m)) return 'gemini-1.5-flash-latest';
+    return 'gemini-2.0-flash';
   }
   return m.replace(/\s*\(.*?\)\s*/g, '').trim() || 'gpt-4o-mini';
 }

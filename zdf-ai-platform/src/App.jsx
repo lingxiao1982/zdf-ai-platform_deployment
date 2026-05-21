@@ -555,16 +555,23 @@ const AdminApp = ({ auth, onLogout, dbUsers, setDbUsers, isTestMode, setIsTestMo
               {VENDORS.map(v => {
                 const kSt = adminKeys[v.id] || { value: '', status: 'idle', msg: '' };
                 return (
-                  <div key={v.id} className="bg-white border border-gray-200 rounded-xl p-4 flex items-center justify-between shadow-sm">
-                    <div className="flex items-center gap-3 w-1/3">
-                      <div className="w-10 h-10 bg-gray-50 border border-gray-100 rounded-lg flex items-center justify-center"><Key size={16} className="text-gray-400"/></div>
-                      <div><h4 className="font-bold text-gray-800 text-sm">{v.name}</h4><p className="text-[10px] text-gray-500">{v.region}</p></div>
+                  <div key={v.id} className="bg-white border border-gray-200 rounded-xl p-4 shadow-sm">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-3 w-1/3">
+                        <div className="w-10 h-10 bg-gray-50 border border-gray-100 rounded-lg flex items-center justify-center"><Key size={16} className="text-gray-400"/></div>
+                        <div><h4 className="font-bold text-gray-800 text-sm">{v.name}</h4><p className="text-[10px] text-gray-500">{v.region}</p></div>
+                      </div>
+                      <div className="flex-1 flex items-center gap-2">
+                        <input type="password" placeholder="填写 API Key" className="flex-1 px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:border-indigo-500" value={kSt.value} onChange={(e) => handleKeyChange(v.id, e.target.value)} />
+                        <button onClick={() => handleTestKey(v.id)} disabled={kSt.status==='testing'||!kSt.value} className="px-4 py-2 bg-slate-100 hover:bg-slate-200 disabled:opacity-40 disabled:cursor-not-allowed text-slate-700 font-bold text-sm rounded-lg transition-colors">{kSt.status==='testing'?'测试中…':'测试'}</button>
+                        <button onClick={() => addLog('info', auth.username, '保存API', `更新了 ${v.name} 的系统级 API Key`)} disabled={kSt.status!=='success'} className={`px-4 py-2 font-bold text-sm rounded-lg transition-colors border ${kSt.status==='success'?'bg-indigo-600 text-white hover:bg-indigo-700 border-indigo-700':'bg-gray-50 text-gray-300 border-gray-200 cursor-not-allowed'}`}>保存写入</button>
+                      </div>
                     </div>
-                    <div className="flex-1 flex items-center gap-2">
-                      <input type="password" placeholder="填写 API Key" className="flex-1 px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:border-indigo-500" value={kSt.value} onChange={(e) => handleKeyChange(v.id, e.target.value)} />
-                      <button onClick={() => handleTestKey(v.id)} disabled={kSt.status==='testing'||!kSt.value} className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-sm rounded-lg transition-colors">测试</button>
-                      <button onClick={() => addLog('info', auth.username, '保存API', `更新了 ${v.name} 的系统级 API Key`)} disabled={kSt.status!=='success'} className={`px-4 py-2 font-bold text-sm rounded-lg transition-colors border ${kSt.status==='success'?'bg-indigo-600 text-white hover:bg-indigo-700 border-indigo-700':'bg-gray-50 text-gray-300 border-gray-200 cursor-not-allowed'}`}>保存写入</button>
-                    </div>
+                    {kSt.msg && (
+                      <p className={`mt-2 ml-1 text-xs font-medium ${kSt.status==='success'?'text-green-600':kSt.status==='error'?'text-red-500':'text-gray-400'}`}>
+                        {kSt.status==='success'?'✓ ':kSt.status==='error'?'✗ ':''}{kSt.msg}
+                      </p>
+                    )}
                   </div>
                 );
               })}
