@@ -1,12 +1,12 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { 
-  Activity, Settings, Users, ShieldCheck, MessageSquare, Play, 
-  CheckCircle2, AlertCircle, Database, LayoutDashboard, LogOut, 
-  Zap, Info, CreditCard, ArrowRight, Paperclip, X, FileText, 
+  Activity, Settings, Users, ShieldCheck, MessageSquare, Play,
+  CheckCircle2, AlertCircle, Database, LayoutDashboard, LogOut,
+  Zap, Info, CreditCard, ArrowRight, Paperclip, X, FileText,
   Clock, Trash2, Mail, Lock, User, Key, MonitorDot,
-  Crown, MessageCircleQuestion, Send, Sliders,
+  Crown, MessageCircleQuestion, Send, Sliders, Image,
   Download, Share2, Smartphone, BellRing, Server, AlertTriangle,
-  ClipboardList, UserCog, Save, Plus, ArrowLeftRight 
+  ClipboardList, UserCog, Save, Plus, ArrowLeftRight
 } from 'lucide-react';
 
 const ROLES = [
@@ -35,10 +35,33 @@ const VENDORS = [
 ];
 
 const PLANS = [
-  { id: 'free', name: 'Free 免费版', price: '¥0 /月', features: ['每月 50k Token', '标准生成速度', '社区支持'] },
-  { id: 'pro', name: 'Pro 专业版', price: '¥99 /月', features: ['每月 2M Token', '多模型高级调度', '优先响应支持'] },
-  { id: 'max', name: 'MAX 旗舰版', price: '¥299 /月', features: ['无限量 Token', '支持企业 API 接入', '1v1 专属技术支持'] },
+  {
+    id: 'free', name: 'Free 免费版', price: '免费', priceEn: '€0 / mo',
+    features: ['每日 20 次任务', '1 路并发', '32K 上下文', '7 天历史记录', 'DeepSeek · Qwen · GPT-4.1-mini'],
+    canExport: false, canApi: false, canRag: false,
+  },
+  {
+    id: 'pro', name: 'Pro 专业版', price: '199~399 RMB/月', priceEn: '€29~59 / mo',
+    features: ['每日 500 次任务', '5 路并发', '256K 上下文', '无限历史记录', 'PDF / Word 导出', 'API 接口', 'RAG 基础版'],
+    canExport: true, canApi: true, canRag: true,
+  },
+  {
+    id: 'enterprise', name: 'Enterprise 企业版', price: '联系我们', priceEn: 'Contact Us',
+    features: ['无限次任务', '50+ 并发', '无限上下文', '私有化部署', 'RBAC 权限', '审计日志', 'SLA 支持'],
+    canExport: true, canApi: true, canRag: true,
+  },
 ];
+
+// 套餐限额（-1 表示无限）
+const PLAN_LIMITS = {
+  free:       { dailyTasks: 20,  historyDays: 7,  canExport: false },
+  pro:        { dailyTasks: 500, historyDays: -1, canExport: true  },
+  enterprise: { dailyTasks: -1,  historyDays: -1, canExport: true  },
+  max:        { dailyTasks: -1,  historyDays: -1, canExport: true  }, // 历史兼容
+};
+
+// AI Credit 消耗定义
+const PIPELINE_CREDITS = 5;  // 四模型协同流水线
 
 const API_BASE_URL = "/api"; // 部署前务必使用相对路径，让 Nginx 代理到后端 3000
 
@@ -259,7 +282,7 @@ const AdminApp = ({ auth, onLogout, dbUsers, setDbUsers, isTestMode, setIsTestMo
   const toggleUserPlan = (userId) => {
     setDbUsers(prev => prev.map(u => {
       if (u.id === userId) {
-        const next = u.plan === 'free' ? 'pro' : u.plan === 'pro' ? 'max' : 'free';
+        const next = u.plan === 'free' ? 'pro' : u.plan === 'pro' ? 'enterprise' : 'free';
         addLog('info', auth.username, '修改套餐', `将用户 ${u.username} 套餐修改为 ${next}`);
         return { ...u, plan: next };
       }
@@ -653,8 +676,8 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, dbUsers 
     D: { vendor: 'openai', model: 'gpt-4o', mode: 'platform', key: '' },
   });
   const [question, setQuestion] = useState("");
-  const [attachments, setAttachments] = useState([]); 
-  const fileInputRef = useRef(null); 
+  const [attachments, setAttachments] = useState([]);
+  const fileInputRef = useRef(null);
   const [strategy, setStrategy] = useState("fusion");
   const [isRunning, setIsRunning] = useState(false);
   const [currentStep, setCurrentStep] = useState(null);
@@ -662,6 +685,12 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, dbUsers 
   const [scores, setScores] = useState({ B: 0, C: 0, D: 0 });
   const [history, setHistory] = useState([]);
   const [resultTab, setResultTab] = useState('final');
+  const [selectedHistoryId, setSelectedHistoryId] = useState(null);
+  const [historySearch, setHistorySearch] = useState('');
+  const todayKey = `zdf_tasks_${auth.id}_${new Date().toDateString()}`;
+  const creditKey = `zdf_credits_${auth.id}_${new Date().toDateString()}`;
+  const [dailyTasksUsed, setDailyTasksUsed] = useState(() => parseInt(sessionStorage.getItem(todayKey) || '0', 10));
+  const [creditsUsed, setCreditsUsed] = useState(() => parseInt(sessionStorage.getItem(creditKey) || '0', 10));
 
   useEffect(() => {
     fetch(`${API_BASE_URL}/user/history`, { headers: { 'Authorization': `Bearer ${window.sessionStorage.getItem('token')}` } })
@@ -698,9 +727,33 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, dbUsers 
 
   const handleDownload = (format) => {
     if (!results.final) return;
-    const blob = new Blob([format==='Excel'? "\uFEFF" + results.final.split('\n').map(l=>`"${l}"`).join('\n') : results.final], { type: format==='Word'?'application/msword':format==='Excel'?'text/csv':'text/plain' });
+    const limits = PLAN_LIMITS[auth.plan] || PLAN_LIMITS.free;
+    if (!limits.canExport) {
+      alert('导出功能需要 Pro 版或以上套餐，请联系管理员升级');
+      return;
+    }
+    const text = results.final;
+    const ts = new Date().toLocaleString();
+    const esc = (s) => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    const htmlTpl = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>ZDF.AI 输出</title><style>body{font-family:system-ui,sans-serif;max-width:800px;margin:40px auto;padding:0 24px;line-height:1.8;color:#222}h1{font-size:20px}p.ts{color:#888;font-size:13px}pre{white-space:pre-wrap;word-break:break-word}@media print{body{margin:0}}</style></head><body><h1>ZDF.AI 输出</h1><p class="ts">${ts}</p><hr><pre>${esc(text)}</pre></body></html>`;
+    if (format === 'pdf') {
+      const win = window.open('', '_blank');
+      win.document.write(htmlTpl + '<script>window.onload=function(){window.print();}<\/script>');
+      win.document.close();
+      return;
+    }
+    const configs = {
+      doc:  { content: text,    mime: 'application/msword', ext: 'doc' },
+      txt:  { content: text,    mime: 'text/plain',         ext: 'txt' },
+      md:   { content: text,    mime: 'text/markdown',      ext: 'md'  },
+      html: { content: htmlTpl, mime: 'text/html',          ext: 'html'},
+    };
+    const cfg = configs[format];
+    if (!cfg) return;
+    const blob = new Blob([cfg.content], { type: cfg.mime });
     const url = URL.createObjectURL(blob);
-    const a = document.createElement('a'); a.href = url; a.download = `ZDF_${Date.now()}.${format==='Word'?'doc':format==='Excel'?'csv':'txt'}`;
+    const a = document.createElement('a');
+    a.href = url; a.download = `ZDF_${Date.now()}.${cfg.ext}`;
     a.click(); URL.revokeObjectURL(url);
   };
   const handleShare = () => { navigator.clipboard.writeText(results.final); alert("已复制纯净结果！"); };
@@ -708,9 +761,17 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, dbUsers 
   const handleFileChange = (e) => {
     Array.from(e.target.files).forEach(file => {
       const isImage = file.type.startsWith('image/');
+      const isText = ['text/plain','text/csv','text/markdown'].includes(file.type) || /\.(txt|csv|md)$/i.test(file.name);
       const reader = new FileReader();
-      reader.onload = (event) => setAttachments(prev => [...prev, { id: Date.now()+Math.random(), name: file.name, type: file.type, isImage, data: isImage ? event.target.result.split(',')[1] : null }]);
-      if (isImage) reader.readAsDataURL(file); else setAttachments(prev => [...prev, { id: Date.now()+Math.random(), name: file.name, type: file.type, isImage: false, data: null }]);
+      if (isImage) {
+        reader.onload = (ev) => setAttachments(prev => [...prev, { id: Date.now()+Math.random(), name: file.name, type: file.type, isImage: true, data: ev.target.result.split(',')[1] }]);
+        reader.readAsDataURL(file);
+      } else if (isText) {
+        reader.onload = (ev) => setAttachments(prev => [...prev, { id: Date.now()+Math.random(), name: file.name, type: file.type, isImage: false, isText: true, data: ev.target.result }]);
+        reader.readAsText(file);
+      } else {
+        setAttachments(prev => [...prev, { id: Date.now()+Math.random(), name: file.name, type: file.type, isImage: false, isText: false, data: null }]);
+      }
     });
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
@@ -732,6 +793,11 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, dbUsers 
 
   const runPipeline = async () => {
     if (!question.trim() && attachments.length === 0) return;
+    const limits = PLAN_LIMITS[auth.plan] || PLAN_LIMITS.free;
+    if (limits.dailyTasks > 0 && dailyTasksUsed >= limits.dailyTasks) {
+      alert(`今日任务已达上限（${limits.dailyTasks} 次），请升级套餐`);
+      return;
+    }
     setIsRunning(true);
     setResultTab('final');
     const newResults = { A: '', B: '', C: '', D: '', final: '' };
@@ -778,6 +844,12 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, dbUsers 
         strategyName: STRATEGIES.find((s) => s.id === strategy).name,
       };
       setHistory((prev) => [histEntry, ...prev]);
+      const newTasks = dailyTasksUsed + 1;
+      const newCredits = creditsUsed + PIPELINE_CREDITS;
+      setDailyTasksUsed(newTasks);
+      setCreditsUsed(newCredits);
+      sessionStorage.setItem(todayKey, String(newTasks));
+      sessionStorage.setItem(creditKey, String(newCredits));
       fetch(`${API_BASE_URL}/user/history`, {
         method: 'POST',
         headers: {
@@ -846,7 +918,8 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, dbUsers 
         <div className="w-10 h-10 bg-white rounded-xl flex items-center justify-center text-indigo-900 font-black">⟳</div>
         <nav className="flex flex-col gap-6 w-full px-2">
           <button onClick={() => setActiveTab('dispatch')} className={`w-full py-3 flex justify-center rounded-xl transition-all ${activeTab === 'dispatch' ? 'bg-indigo-700 text-white' : 'hover:bg-indigo-800'}`} title="调度中心"><Activity size={22} /></button>
-          <button onClick={() => setActiveTab('profile')} className={`w-full py-3 flex justify-center rounded-xl transition-all ${activeTab === 'profile' ? 'bg-indigo-700 text-white' : 'hover:bg-indigo-800'}`} title="设置"><Settings size={22} /></button>
+          <button onClick={() => setActiveTab('history')} className={`w-full py-3 flex justify-center rounded-xl transition-all ${activeTab === 'history' ? 'bg-indigo-700 text-white' : 'hover:bg-indigo-800'}`} title="历史记录"><Clock size={22} /></button>
+          <button onClick={() => setActiveTab('profile')} className={`w-full py-3 flex justify-center rounded-xl transition-all ${activeTab === 'profile' ? 'bg-indigo-700 text-white' : 'hover:bg-indigo-800'}`} title="账户设置"><Settings size={22} /></button>
           
           <div className="w-8 h-[1px] bg-indigo-800 mx-auto my-2"></div>
           
@@ -895,9 +968,13 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, dbUsers 
                       {isRunning && !results.final && <div className="text-center text-gray-400 py-10">模型流转中...</div>}
                       {results.final && resultTab==='final' && (
                         <div className="text-gray-800 leading-relaxed whitespace-pre-wrap">{results.final}
-                          <div className="mt-8 pt-4 border-t border-gray-100 flex gap-2">
-                            <button onClick={()=>handleDownload('Word')} className="px-3 py-1.5 bg-indigo-50 text-indigo-600 rounded text-xs font-bold"><Download size={14} className="inline mr-1"/>下载 Word</button>
-                            <button onClick={handleShare} className="px-3 py-1.5 bg-gray-50 text-gray-600 rounded text-xs font-bold"><Share2 size={14} className="inline mr-1"/>复制分享</button>
+                          <div className="mt-8 pt-4 border-t border-gray-100 flex flex-wrap gap-2">
+                            <button onClick={()=>handleDownload('doc')} className="px-3 py-1.5 bg-indigo-50 text-indigo-600 rounded text-xs font-bold"><Download size={14} className="inline mr-1"/>Word</button>
+                            <button onClick={()=>handleDownload('txt')} className="px-3 py-1.5 bg-indigo-50 text-indigo-600 rounded text-xs font-bold"><Download size={14} className="inline mr-1"/>TXT</button>
+                            <button onClick={()=>handleDownload('md')} className="px-3 py-1.5 bg-indigo-50 text-indigo-600 rounded text-xs font-bold"><Download size={14} className="inline mr-1"/>Markdown</button>
+                            <button onClick={()=>handleDownload('html')} className="px-3 py-1.5 bg-green-50 text-green-700 rounded text-xs font-bold"><Download size={14} className="inline mr-1"/>网页</button>
+                            <button onClick={()=>handleDownload('pdf')} className="px-3 py-1.5 bg-red-50 text-red-600 rounded text-xs font-bold"><Download size={14} className="inline mr-1"/>PDF</button>
+                            <button onClick={handleShare} className="px-3 py-1.5 bg-gray-50 text-gray-600 rounded text-xs font-bold"><Share2 size={14} className="inline mr-1"/>复制</button>
                           </div>
                         </div>
                       )}
@@ -914,10 +991,24 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, dbUsers 
 
             <div className="absolute bottom-0 left-0 right-0 p-6 bg-gradient-to-t from-gray-50 via-gray-50 to-transparent">
               <div className="max-w-4xl mx-auto bg-white border border-gray-300 rounded-3xl shadow-lg focus-within:border-indigo-500 overflow-hidden flex flex-col">
+                {attachments.length > 0 && (
+                  <div className="flex flex-wrap gap-2 px-4 pt-3">
+                    {attachments.map(att => (
+                      <span key={att.id} className="flex items-center gap-1 px-2 py-1 bg-indigo-50 text-indigo-700 rounded-lg text-xs font-medium border border-indigo-100 max-w-[200px]">
+                        {att.isImage ? <Image size={12} className="shrink-0"/> : <FileText size={12} className="shrink-0"/>}
+                        <span className="truncate">{att.name}</span>
+                        <button onClick={() => setAttachments(prev => prev.filter(a => a.id !== att.id))} className="ml-1 text-indigo-300 hover:text-red-500 shrink-0"><X size={11}/></button>
+                      </span>
+                    ))}
+                  </div>
+                )}
                 <textarea placeholder="按 Enter 发送，Shift+Enter 换行" className="w-full h-24 p-4 outline-none resize-none" value={question} onChange={e=>setQuestion(e.target.value)} onKeyDown={e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();if(!isRunning)runPipeline();}}}/>
                 <div className="flex justify-between items-center bg-gray-50 p-2 pl-4 border-t border-gray-100">
-                  <div className="flex items-center"><input type="file" ref={fileInputRef} onChange={handleFileChange} className="hidden"/><button onClick={()=>fileInputRef.current?.click()} className="p-2 text-gray-500 hover:text-indigo-600"><Paperclip size={18}/></button></div>
-                  <button onClick={runPipeline} disabled={isRunning} className="px-5 py-2 bg-indigo-600 text-white rounded-xl font-bold flex items-center gap-2"><Send size={14}/> 发送</button>
+                  <div className="flex items-center gap-1">
+                    <input type="file" ref={fileInputRef} onChange={handleFileChange} className="hidden" accept="image/*,.pdf,.doc,.docx,.xls,.xlsx,.txt,.csv,.md" multiple/>
+                    <button onClick={()=>fileInputRef.current?.click()} className="p-2 text-gray-500 hover:text-indigo-600" title="上传文件（图片、文档、PDF等）"><Paperclip size={18}/></button>
+                  </div>
+                  <button onClick={runPipeline} disabled={isRunning} className="px-5 py-2 bg-indigo-600 text-white rounded-xl font-bold flex items-center gap-2 disabled:opacity-50"><Send size={14}/> 发送</button>
                 </div>
               </div>
             </div>
@@ -925,22 +1016,190 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, dbUsers 
         </>
       )}
 
-      {activeTab === 'profile' && (
-        <div className="flex-1 p-10 flex justify-center overflow-y-auto">
-           <div className="max-w-4xl w-full">
-              <h2 className="text-3xl font-black mb-8">账户订阅</h2>
-              <div className="grid grid-cols-3 gap-6">
-                {PLANS.map(p => (
-                  <div key={p.id} className={`p-6 border-2 rounded-2xl ${auth.plan===p.id?'border-indigo-600 bg-indigo-50':'border-gray-200 bg-white'}`}>
-                    <h3 className="font-bold text-lg">{p.name}</h3>
-                    <p className="text-2xl font-black my-2">{p.price}</p>
-                    <button className={`w-full mt-4 py-2 rounded-lg font-bold ${auth.plan===p.id?'bg-indigo-600 text-white':'bg-gray-100 text-gray-600'}`}>{auth.plan===p.id?'当前生效':'联系管理员'}</button>
+      {activeTab === 'history' && (
+        <div className="flex-1 flex overflow-hidden">
+          {/* 左侧列表 */}
+          <div className="w-80 bg-white border-r border-gray-200 flex flex-col">
+            <div className="p-4 border-b border-gray-100">
+              <h2 className="font-bold flex items-center gap-2 mb-3"><Clock size={18} className="text-indigo-500"/> 历史记录 <span className="ml-auto text-xs text-gray-400 font-normal">{history.length} 条</span></h2>
+              <input
+                type="text"
+                placeholder="搜索问题…"
+                value={historySearch}
+                onChange={e => setHistorySearch(e.target.value)}
+                className="w-full px-3 py-2 text-sm border border-gray-200 rounded-xl outline-none focus:border-indigo-500"
+              />
+            </div>
+            <div className="flex-1 overflow-y-auto">
+              {(() => {
+                const limits = PLAN_LIMITS[auth.plan] || PLAN_LIMITS.free;
+                if (limits.historyDays > 0) return (
+                  <div className="mx-3 mt-3 px-3 py-2 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-700">
+                    Free 版仅保留 {limits.historyDays} 天记录 · <span className="font-bold cursor-pointer underline" onClick={() => setActiveTab('profile')}>升级套餐</span>
                   </div>
-                ))}
+                );
+              })()}
+              {history.length === 0 && (
+                <div className="text-center text-gray-400 text-sm py-16">暂无历史记录</div>
+              )}
+              {history
+                .filter(h => {
+                  const limits = PLAN_LIMITS[auth.plan] || PLAN_LIMITS.free;
+                  if (limits.historyDays < 0) return true;
+                  return (Date.now() - h.id) < limits.historyDays * 86400000;
+                })
+                .filter(h => !historySearch || h.question.toLowerCase().includes(historySearch.toLowerCase()))
+                .map(h => (
+                  <button
+                    key={h.id}
+                    onClick={() => setSelectedHistoryId(h.id)}
+                    className={`w-full text-left px-4 py-3 border-b border-gray-50 transition-colors ${selectedHistoryId === h.id ? 'bg-indigo-50 border-l-2 border-l-indigo-500' : 'hover:bg-gray-50'}`}
+                  >
+                    <p className="text-sm font-medium text-gray-800 line-clamp-2 mb-1">{h.question}</p>
+                    <div className="flex items-center gap-2 text-[10px] text-gray-400">
+                      <Clock size={10}/>{h.timestamp}
+                      <span className="px-1.5 py-0.5 bg-gray-100 rounded text-gray-500">{h.strategyName}</span>
+                    </div>
+                  </button>
+                ))
+              }
+            </div>
+          </div>
+
+          {/* 右侧详情 */}
+          <div className="flex-1 overflow-y-auto p-8">
+            {!selectedHistoryId ? (
+              <div className="h-full flex items-center justify-center text-gray-400">
+                <div className="text-center">
+                  <Clock size={40} className="mx-auto mb-3 opacity-30"/>
+                  <p className="text-sm">选择左侧记录查看详情</p>
+                </div>
               </div>
-           </div>
+            ) : (() => {
+              const item = history.find(h => h.id === selectedHistoryId);
+              if (!item) return null;
+              return (
+                <div className="max-w-3xl mx-auto">
+                  <div className="flex items-center justify-between mb-6">
+                    <div className="flex items-center gap-2 text-xs text-gray-400">
+                      <Clock size={12}/>{item.timestamp}
+                      <span className="px-2 py-0.5 bg-indigo-50 text-indigo-600 rounded font-medium">{item.strategyName}</span>
+                    </div>
+                    <button
+                      onClick={() => { setQuestion(item.question); setActiveTab('dispatch'); }}
+                      className="flex items-center gap-1.5 px-3 py-1.5 bg-indigo-600 text-white rounded-lg text-xs font-bold hover:bg-indigo-700 transition-colors"
+                    >
+                      <ArrowRight size={12}/> 重新提问
+                    </button>
+                  </div>
+                  <div className="bg-indigo-50 border border-indigo-100 rounded-2xl p-5 mb-6">
+                    <p className="text-xs font-bold text-indigo-400 mb-2">问题</p>
+                    <p className="text-gray-800 text-sm leading-relaxed whitespace-pre-wrap">{item.question}</p>
+                  </div>
+                  <div className="bg-white border border-gray-200 rounded-2xl p-5 shadow-sm">
+                    <p className="text-xs font-bold text-gray-400 mb-3">答案</p>
+                    <div className="text-gray-800 text-sm leading-relaxed whitespace-pre-wrap">{item.answer}</div>
+                  </div>
+                </div>
+              );
+            })()}
+          </div>
         </div>
       )}
+
+      {activeTab === 'profile' && (() => {
+        const limits = PLAN_LIMITS[auth.plan] || PLAN_LIMITS.free;
+        const currentPlan = PLANS.find(p => p.id === auth.plan) || PLANS[0];
+        const taskPct = limits.dailyTasks > 0 ? Math.min(100, Math.round(dailyTasksUsed / limits.dailyTasks * 100)) : 0;
+        const visibleHistory = history.filter(h => limits.historyDays < 0 || (Date.now() - h.id) < limits.historyDays * 86400000);
+        return (
+          <div className="flex-1 p-8 overflow-y-auto">
+            <div className="max-w-4xl mx-auto space-y-8">
+              <h2 className="text-2xl font-black text-gray-800">用户中心</h2>
+
+              {/* 当前套餐卡片 */}
+              <div className="bg-gradient-to-r from-indigo-600 to-indigo-500 rounded-3xl p-6 text-white shadow-lg">
+                <div className="flex items-center justify-between mb-4">
+                  <div>
+                    <p className="text-indigo-200 text-xs font-bold uppercase tracking-wider mb-1">当前套餐</p>
+                    <h3 className="text-2xl font-black">{currentPlan.name}</h3>
+                    <p className="text-indigo-200 text-sm mt-0.5">{currentPlan.price} · {currentPlan.priceEn}</p>
+                  </div>
+                  <Crown size={40} className="text-indigo-300 opacity-60"/>
+                </div>
+                <div className="grid grid-cols-4 gap-4 mt-4">
+                  {[
+                    { label: '今日任务', value: `${dailyTasksUsed}${limits.dailyTasks > 0 ? ` / ${limits.dailyTasks}` : ' / ∞'}`, sub: limits.dailyTasks > 0 ? `${taskPct}%` : '无限制' },
+                    { label: 'Credits 已用', value: creditsUsed, sub: `${PIPELINE_CREDITS} Credits/次` },
+                    { label: '历史记录', value: `${visibleHistory.length} 条`, sub: limits.historyDays > 0 ? `保留 ${limits.historyDays} 天` : '永久保留' },
+                    { label: '导出权限', value: limits.canExport ? '✓ 开启' : '✗ 不可用', sub: limits.canExport ? 'Word/PDF/HTML' : '需升级 Pro' },
+                  ].map(stat => (
+                    <div key={stat.label} className="bg-white/10 rounded-2xl p-3 backdrop-blur-sm">
+                      <p className="text-indigo-200 text-[10px] font-bold uppercase mb-1">{stat.label}</p>
+                      <p className="text-white text-lg font-black">{stat.value}</p>
+                      <p className="text-indigo-300 text-[10px] mt-0.5">{stat.sub}</p>
+                    </div>
+                  ))}
+                </div>
+                {limits.dailyTasks > 0 && (
+                  <div className="mt-4">
+                    <div className="flex justify-between text-xs text-indigo-200 mb-1">
+                      <span>今日任务进度</span><span>{dailyTasksUsed}/{limits.dailyTasks}</span>
+                    </div>
+                    <div className="w-full bg-white/20 rounded-full h-1.5">
+                      <div className="bg-white rounded-full h-1.5 transition-all" style={{ width: `${taskPct}%` }}/>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* 套餐对比表 */}
+              <div className="bg-white border border-gray-200 rounded-3xl shadow-sm overflow-hidden">
+                <div className="p-6 border-b border-gray-100">
+                  <h3 className="font-bold text-gray-800 flex items-center gap-2"><CreditCard size={18} className="text-indigo-500"/> 套餐对比</h3>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="bg-gray-50">
+                        <th className="text-left px-6 py-3 text-xs font-bold text-gray-500 uppercase w-1/4">功能</th>
+                        {PLANS.map(p => (
+                          <th key={p.id} className={`px-6 py-3 text-center text-xs font-bold uppercase ${auth.plan === p.id ? 'text-indigo-600 bg-indigo-50' : 'text-gray-500'}`}>
+                            {p.name.split(' ')[0]}
+                            {auth.plan === p.id && <span className="ml-1 text-[10px] bg-indigo-600 text-white px-1.5 py-0.5 rounded-full">当前</span>}
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-50">
+                      {[
+                        ['每日任务', '20 次', '500 次', '无限'],
+                        ['并发数', '1', '5', '50+'],
+                        ['上下文长度', '32K', '256K', '无限'],
+                        ['历史记录', '7 天', '永久', '永久'],
+                        ['导出 (Word/PDF)', '✗', '✓', '✓'],
+                        ['API 接口', '✗', '✓', '✓'],
+                        ['RAG 知识库', '✗', '基础版', '企业版'],
+                        ['价格', '免费', '199~399 RMB/月', '联系我们'],
+                      ].map(([feature, ...vals]) => (
+                        <tr key={feature} className="hover:bg-gray-50">
+                          <td className="px-6 py-3 text-gray-600 font-medium">{feature}</td>
+                          {vals.map((v, i) => (
+                            <td key={i} className={`px-6 py-3 text-center font-medium ${auth.plan === PLANS[i]?.id ? 'bg-indigo-50/50 text-indigo-700' : v === '✗' ? 'text-gray-300' : v === '✓' ? 'text-green-600' : 'text-gray-700'}`}>{v}</td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <div className="p-4 bg-gray-50 border-t border-gray-100 text-center">
+                  <p className="text-xs text-gray-400">套餐升级请联系管理员 · Enterprise 版支持私有化部署与定制 SLA</p>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 };

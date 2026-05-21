@@ -46,7 +46,7 @@ function defaultDb() {
         role: 'admin',
         roleDetail: 'super',
         name: '系统管理员',
-        plan: 'max',
+        plan: 'enterprise',
         status: 'active',
         balance: 9999.0,
       },
