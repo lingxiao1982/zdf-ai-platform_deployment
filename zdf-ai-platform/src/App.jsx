@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { 
   Activity, Settings, Users, ShieldCheck, MessageSquare, Play,
   CheckCircle2, AlertCircle, Database, LayoutDashboard, LogOut,
@@ -6,7 +6,8 @@ import {
   Clock, Trash2, Mail, Lock, User, Key, MonitorDot,
   Crown, MessageCircleQuestion, Send, Sliders, Image,
   Download, Share2, Smartphone, BellRing, Server, AlertTriangle,
-  ClipboardList, UserCog, Save, Plus, ArrowLeftRight
+  ClipboardList, UserCog, Save, Plus, ArrowLeftRight, BookOpen, Upload, Search,
+  GitBranch, Shield, Cloud, TrendingUp, DollarSign, PieChart, BarChart3
 } from 'lucide-react';
 
 const ROLES = [
@@ -23,15 +24,15 @@ const STRATEGIES = [
   { id: 'score', name: '评分最优', desc: '仅输出评分最高的中间步骤结果' },
 ];
 
-const VENDORS = [
-  { id: 'openai', name: 'OpenAI', region: 'US', models: ['gpt-4o', 'gpt-4-turbo', 'gpt-3.5-turbo'] },
-  { id: 'anthropic', name: 'Anthropic', region: 'US', models: ['claude-3.5-sonnet', 'claude-3-opus', 'claude-3-haiku'] },
-  { id: 'google', name: 'Google', region: 'US', models: ['gemini-1.5-pro', 'gemini-1.5-flash', 'gemini-2.5-flash'] },
-  { id: 'deepseek', name: 'DeepSeek (深度求索)', region: 'CN', models: ['deepseek-chat (V3)', 'deepseek-coder'] },
-  { id: 'alibaba', name: 'Alibaba (阿里)', region: 'CN', models: ['qwen-max', 'qwen-plus', 'qwen-turbo'] },
-  { id: 'zhipu', name: 'Zhipu (智谱)', region: 'CN', models: ['glm-4', 'glm-4v', 'glm-3-turbo'] },
-  { id: 'baidu', name: 'Baidu (百度)', region: 'CN', models: ['ernie-4.0', 'ernie-3.5'] },
-  { id: 'moonshot', name: 'Moonshot (月之暗面)', region: 'CN', models: ['moonshot-v1-8k', 'moonshot-v1-32k'] },
+const FALLBACK_VENDORS = [
+  { id: 'openai', name: 'OpenAI', region: 'US', models: ['gpt-4.1', 'gpt-4.1-mini', 'gpt-4.1-nano', 'gpt-4o', 'o4-mini'] },
+  { id: 'anthropic', name: 'Anthropic', region: 'US', models: ['claude-sonnet-4-6', 'claude-opus-4-8', 'claude-haiku-4-5', 'claude-sonnet-4-5'] },
+  { id: 'google', name: 'Google', region: 'US', models: ['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-2.5-flash-lite'] },
+  { id: 'deepseek', name: 'DeepSeek (深度求索)', region: 'CN', models: ['deepseek-v4-pro', 'deepseek-v4-flash', 'deepseek-chat', 'deepseek-reasoner'] },
+  { id: 'alibaba', name: 'Alibaba (阿里)', region: 'CN', models: ['qwen-max', 'qwen-plus', 'qwen-turbo', 'qwq-plus', 'qwen3-coder-plus'] },
+  { id: 'zhipu', name: 'Zhipu (智谱)', region: 'CN', models: ['glm-5.1', 'glm-5', 'glm-4-plus', 'glm-4'] },
+  { id: 'doubao', name: 'Doubao (豆包)', region: 'CN', models: ['doubao-seed-2.0-pro', 'doubao-seed-2.0-lite', 'doubao-seed-2.0-code', 'doubao-pro-128k'] },
+  { id: 'moonshot', name: 'Moonshot (月之暗面)', region: 'CN', models: ['kimi-k2.6', 'kimi-k2.5', 'moonshot-v1-128k'] },
 ];
 
 const PLANS = [
@@ -54,14 +55,15 @@ const PLANS = [
 
 // 套餐限额（-1 表示无限）
 const PLAN_LIMITS = {
-  free:       { dailyTasks: 20,  historyDays: 7,  canExport: false },
-  pro:        { dailyTasks: 500, historyDays: -1, canExport: true  },
-  enterprise: { dailyTasks: -1,  historyDays: -1, canExport: true  },
-  max:        { dailyTasks: -1,  historyDays: -1, canExport: true  }, // 历史兼容
+  free:       { dailyTasks: 20,  historyDays: 7,  canExport: false, canRag: false },
+  pro:        { dailyTasks: 500, historyDays: -1, canExport: true,  canRag: true  },
+  enterprise: { dailyTasks: -1,  historyDays: -1, canExport: true,  canRag: true  },
+  max:        { dailyTasks: -1,  historyDays: -1, canExport: true,  canRag: true  }, // 历史兼容
 };
 
-// AI Credit 消耗定义
-const PIPELINE_CREDITS = 5;  // 四模型协同流水线
+// AI Credit 消耗定义（与后端 CLAUDE.md 一致）
+const CREDIT_COSTS = { single: 1, pipeline: 5, rag: 10, deepReasoning: 20 };
+const PIPELINE_CREDITS = 5;  // 四模型协同流水线总消耗（前端 UI 展示用）
 
 const API_BASE_URL = "/api"; // 部署前务必使用相对路径，让 Nginx 代理到后端 3000
 
@@ -80,7 +82,7 @@ const stripMarkdown = (text) => {
  * @param {{ roleId: string, vendor: string, model: string, mode: string, selfKey?: string } | null} [dispatch]
  * @returns {Promise<string>}
  */
-const callGemini = async (prompt, systemPrompt = "", files = [], dispatch = null) => {
+const callGemini = async (prompt, systemPrompt = "", files = [], dispatch = null, extraPayload = {}) => {
   let retries = 0;
   const maxRetries = 3;
   const payload = {
@@ -88,6 +90,7 @@ const callGemini = async (prompt, systemPrompt = "", files = [], dispatch = null
     systemPrompt,
     files: files.map(f => ({ name: f.name, type: f.type, isImage: f.isImage, data: f.data })),
     ...(dispatch ? { dispatch } : {}),
+    ...extraPayload,
   };
 
   const execute = async () => {
@@ -128,34 +131,181 @@ const callGemini = async (prompt, systemPrompt = "", files = [], dispatch = null
   }
 };
 
+// --- 流水线传送带动画 ---
+const pipelineCSS = `
+@keyframes pl-glow{0%,100%{box-shadow:0 0 8px 2px rgba(99,102,241,.3)}50%{box-shadow:0 0 20px 6px rgba(99,102,241,.7)}}
+@keyframes pl-gear{from{transform:rotate(0)}to{transform:rotate(360deg)}}
+@keyframes pl-packet{0%{left:0;opacity:0}10%{opacity:1}90%{opacity:1}100%{left:100%;opacity:0}}
+@keyframes pl-done-glow{0%{opacity:0;filter:brightness(1)}30%{opacity:1;filter:brightness(1.4)}100%{opacity:1;filter:brightness(1)}}
+@keyframes pl-bulb-pop{0%{transform:scale(0) rotate(-20deg);opacity:0}50%{transform:scale(1.25) rotate(5deg);opacity:1}70%{transform:scale(0.95) rotate(-2deg)}100%{transform:scale(1) rotate(0);opacity:1}}
+@keyframes pl-rays{0%{transform:scale(0);opacity:.6}100%{transform:scale(2.5);opacity:0}}
+@keyframes pl-fadein{0%{opacity:0;transform:translateY(8px)}100%{opacity:1;transform:translateY(0)}}
+.pl-node-active{animation:pl-glow 1.5s ease-in-out infinite}
+.pl-gear{animation:pl-gear 2s linear infinite}
+.pl-packet{position:absolute;top:50%;transform:translateY(-50%);animation:pl-packet 1.8s ease-in-out infinite}
+.pl-done-glow{animation:pl-done-glow .8s ease-out forwards}
+.pl-bulb-pop{animation:pl-bulb-pop .6s cubic-bezier(.34,1.56,.64,1) forwards}
+.pl-rays{animation:pl-rays 1s ease-out forwards}
+.pl-fadein{animation:pl-fadein .5s ease-out .3s both}
+`;
+
+const PipelineAnimation = ({ currentStep, configs, results, vendors, isComplete }) => {
+  const steps = [
+    { id: 'A', label: '生成者', desc: '生成初始答案' },
+    { id: 'B', label: '校核者', desc: '事实与逻辑校核' },
+    { id: 'C', label: '审核者', desc: '质量与风险审核' },
+    { id: 'D', label: '终审者', desc: '终审并输出结果' },
+  ];
+  const stepIdx = steps.findIndex(s => s.id === currentStep);
+
+  const getStatus = (i) => {
+    if (isComplete) return 'done';
+    if (i < stepIdx) return 'done';
+    if (i === stepIdx) return 'active';
+    return 'pending';
+  };
+
+  const getVendorModel = (roleId) => {
+    const c = configs[roleId];
+    if (!c) return { vName: '', mName: '' };
+    const v = vendors.find(x => x.id === c.vendor);
+    return { vName: v ? v.name : c.vendor, mName: c.model };
+  };
+
+  return (
+    <div className="py-6">
+      <style>{pipelineCSS}</style>
+
+      {/* Completion celebration */}
+      {isComplete && (
+        <div className="flex flex-col items-center mb-6">
+          <div className="relative">
+            <div className="pl-rays absolute inset-0 flex items-center justify-center">
+              <div className="w-24 h-24 rounded-full bg-gradient-to-br from-amber-200 to-yellow-400 opacity-30" />
+            </div>
+            <div className="pl-bulb-pop text-5xl relative z-10">💡</div>
+          </div>
+          <div className="pl-fadein mt-3 text-lg font-black text-transparent bg-clip-text bg-gradient-to-r from-amber-500 via-yellow-500 to-amber-600">
+            决策完成
+          </div>
+        </div>
+      )}
+
+      {/* Conveyor belt */}
+      <div className="flex items-center justify-center gap-0 px-4">
+        {steps.map((step, i) => {
+          const status = getStatus(i);
+          const { vName, mName } = getVendorModel(step.id);
+          return (
+            <React.Fragment key={step.id}>
+              {/* Node */}
+              <div className="flex flex-col items-center" style={{ minWidth: 110 }}>
+                <div
+                  className={`relative w-14 h-14 rounded-2xl flex items-center justify-center text-lg font-black border-2 transition-all duration-500 ${
+                    status === 'done'
+                      ? (isComplete ? 'bg-gradient-to-br from-amber-400 to-yellow-500 border-amber-400 text-white shadow-lg pl-done-glow' : 'bg-emerald-500 border-emerald-400 text-white shadow-md')
+                      : status === 'active'
+                      ? 'bg-indigo-600 border-indigo-400 text-white pl-node-active'
+                      : 'bg-gray-100 border-gray-200 text-gray-400'
+                  }`}
+                >
+                  {status === 'done' && !isComplete && (
+                    <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}><path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7"/></svg>
+                  )}
+                  {status === 'done' && isComplete && <span>{step.id}</span>}
+                  {status === 'active' && (
+                    <svg className="w-6 h-6 pl-gear" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}><path d="M12 15a3 3 0 100-6 3 3 0 000 6z"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 01-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
+                  )}
+                  {status === 'pending' && <span className="text-base">{step.id}</span>}
+                </div>
+                <div className={`mt-2 text-xs font-bold ${status === 'active' ? 'text-indigo-600' : status === 'done' ? (isComplete ? 'text-amber-600' : 'text-emerald-600') : 'text-gray-400'}`}>
+                  {step.label}
+                </div>
+                <div className="text-[10px] text-gray-400 mt-0.5 text-center leading-tight truncate max-w-[110px]">
+                  {status === 'active' ? `${vName} · ${mName}` : step.desc}
+                </div>
+              </div>
+
+              {/* Connector line with data packet */}
+              {i < steps.length - 1 && (
+                <div className="relative flex-1 mx-1" style={{ minWidth: 40, height: 4 }}>
+                  <div className={`absolute inset-0 rounded-full transition-colors duration-500 ${
+                    getStatus(i + 1) !== 'pending' || status === 'active'
+                      ? (isComplete ? 'bg-gradient-to-r from-amber-400 to-yellow-400' : 'bg-indigo-200')
+                      : 'bg-gray-200'
+                  }`} />
+                  {status === 'active' && (
+                    <div className="pl-packet w-3 h-3 rounded-full bg-indigo-500 shadow-lg shadow-indigo-300" />
+                  )}
+                  {status === 'done' && getStatus(i + 1) === 'active' && (
+                    <div className="pl-packet w-3 h-3 rounded-full bg-indigo-500 shadow-lg shadow-indigo-300" />
+                  )}
+                </div>
+              )}
+            </React.Fragment>
+          );
+        })}
+      </div>
+
+      {/* Status text */}
+      {!isComplete && currentStep && (
+        <div className="text-center mt-5">
+          <span className="inline-flex items-center gap-2 px-4 py-2 bg-indigo-50 rounded-full text-sm text-indigo-700 font-bold">
+            <span className="w-2 h-2 rounded-full bg-indigo-500 animate-pulse" />
+            {(() => {
+              const { vName, mName } = getVendorModel(currentStep);
+              const s = steps.find(x => x.id === currentStep);
+              return `${vName} (${mName}) 正在${s?.desc || '处理'}...`;
+            })()}
+          </span>
+        </div>
+      )}
+    </div>
+  );
+};
+
 const AuthScreen = ({ onLogin, onRegister, dbUsers, isTestMode }) => {
   const [isRegister, setIsRegister] = useState(false);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
 
-  const handleAction = () => {
+  const handleAction = async () => {
     setError('');
     if (!username || !password) return setError('请输入账号和密码');
-    
-    if (isRegister) {
-      if (dbUsers.find(u => u.username === username)) return setError('该账号已被注册，请直接登录');
-      const newUser = {
-        id: `usr_${Date.now().toString().slice(-4)}`,
-        username, password, role: 'user', name: username, roleDetail: 'user',
-        plan: isTestMode ? 'pro' : 'free',
-        status: 'active', balance: 0.0
-      };
-      onRegister(newUser);
-      onLogin(newUser);
-    } else {
-      const user = dbUsers.find(u => u.username === username && u.password === password);
-      if (user) {
-        if (user.status !== 'active') return setError('该账号已被管理员封禁，请联系客服');
-        onLogin(user);
+    setLoading(true);
+    try {
+      if (isRegister) {
+        const newUser = {
+          id: `usr_${Date.now().toString().slice(-4)}`,
+          username, password, role: 'user', name: username, roleDetail: 'user',
+          plan: isTestMode ? 'pro' : 'free',
+          status: 'active', balance: 0.0
+        };
+        const res = await fetch(`${API_BASE_URL}/auth/register`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(newUser)
+        });
+        const data = await res.json();
+        if (!res.ok) return setError(data.error || '注册失败');
+        window.sessionStorage.setItem('token', data.token);
+        onRegister(data.user);
+        onLogin(data.user);
       } else {
-        setError('账号或密码错误，请重试');
+        const res = await fetch(`${API_BASE_URL}/auth/login`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username, password })
+        });
+        const data = await res.json();
+        if (!res.ok) return setError(data.error || '登录失败');
+        window.sessionStorage.setItem('token', data.token);
+        onLogin(data.user);
       }
+    } catch (e) {
+      setError('无法连接后端服务，请确保后端已启动（端口 3000）');
+    } finally {
+      setLoading(false);
     }
   };
   
@@ -176,13 +326,13 @@ const AuthScreen = ({ onLogin, onRegister, dbUsers, isTestMode }) => {
           {error && <div className="p-3 bg-red-50 text-red-600 text-xs font-bold rounded-xl border border-red-100">{error}</div>}
           <div className="relative">
             <User className="absolute left-3 top-3 text-gray-400" size={20} />
-            <input type="text" placeholder="账号 (默认管理员: admin123)" value={username} onChange={(e) => setUsername(e.target.value)} className="w-full pl-10 pr-4 py-3 bg-gray-50 border border-gray-200 rounded-xl focus:border-indigo-500 outline-none transition-colors" onKeyDown={(e) => e.key === 'Enter' && handleAction()} />
+            <input type="text" placeholder="请输入账号" value={username} onChange={(e) => setUsername(e.target.value)} className="w-full pl-10 pr-4 py-3 bg-gray-50 border border-gray-200 rounded-xl focus:border-indigo-500 outline-none transition-colors" onKeyDown={(e) => e.key === 'Enter' && handleAction()} />
           </div>
           <div className="relative">
             <Lock className="absolute left-3 top-3 text-gray-400" size={20} />
-            <input type="password" placeholder="密码 (默认管理密码: admin456)" value={password} onChange={(e) => setPassword(e.target.value)} className="w-full pl-10 pr-4 py-3 bg-gray-50 border border-gray-200 rounded-xl focus:border-indigo-500 outline-none transition-colors" onKeyDown={(e) => e.key === 'Enter' && handleAction()} />
+            <input type="password" placeholder="请输入密码" value={password} onChange={(e) => setPassword(e.target.value)} className="w-full pl-10 pr-4 py-3 bg-gray-50 border border-gray-200 rounded-xl focus:border-indigo-500 outline-none transition-colors" onKeyDown={(e) => e.key === 'Enter' && handleAction()} />
           </div>
-          <button onClick={handleAction} className="w-full py-3 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-xl shadow-md transition-colors">{isRegister ? '立即注册并进入' : '进入系统'}</button>
+          <button onClick={handleAction} disabled={loading} className="w-full py-3 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-xl shadow-md transition-colors disabled:opacity-60">{loading ? '验证中...' : (isRegister ? '立即注册并进入' : '进入系统')}</button>
         </div>
         <div className="mt-6 pt-6 border-t border-gray-100 text-center text-sm text-gray-500">
           {isRegister ? '已有账户？' : '还没有账户？'} 
@@ -193,7 +343,7 @@ const AuthScreen = ({ onLogin, onRegister, dbUsers, isTestMode }) => {
   );
 };
 
-const AdminApp = ({ auth, onLogout, dbUsers, setDbUsers, isTestMode, setIsTestMode, adminKeys, setAdminKeys, alertsConfig, setAlertsConfig, dbLogs, setDbLogs, onSwitchToUser }) => {
+const AdminApp = ({ auth, onLogout, dbUsers, setDbUsers, isTestMode, setIsTestMode, adminKeys, setAdminKeys, alertsConfig, setAlertsConfig, dbLogs, setDbLogs, vendors, setVendors, strategy, setStrategy, onSwitchToUser, adminTemplates, setAdminTemplates }) => {
   const [subTab, setSubTab] = useState('overview');
   
   const [showSelfCheck, setShowSelfCheck] = useState(true);
@@ -202,8 +352,15 @@ const AdminApp = ({ auth, onLogout, dbUsers, setDbUsers, isTestMode, setIsTestMo
     { id: 'api', name: '平台 API 连通性与余额', status: 'pending', msg: '' },
     { id: 'storage', name: '存储卷健康状态', status: 'pending', msg: '' }
   ]);
-  const [checkPhase, setCheckPhase] = useState('running'); 
+  const [checkPhase, setCheckPhase] = useState('running');
   const [alertSent, setAlertSent] = useState(false);
+  const [editingVendor, setEditingVendor] = useState(null);
+  const [editTpl, setEditTpl] = useState(null);
+  const [newTpl, setNewTpl] = useState({ title: '', prompt: '', category: '通用', plan: 'free' });
+  const [vendorForm, setVendorForm] = useState({ id: '', name: '', region: 'CN', models: '' });
+  const [usageStats, setUsageStats] = useState(null);
+  const [trendTab, setTrendTab] = useState('tasks');
+  const [logFilter, setLogFilter] = useState('all'); // 'all' | 'alert' | 'warn' | 'info'
 
   const addLog = (type, operator, action, detail) => {
     setDbLogs(prev => [{
@@ -227,24 +384,28 @@ const AdminApp = ({ auth, onLogout, dbUsers, setDbUsers, isTestMode, setIsTestMo
   useEffect(() => {
     let isMounted = true;
     const runCheck = async () => {
-      await new Promise(r => setTimeout(r, 800));
-      if(!isMounted) return;
-      setCheckSteps(prev => prev.map(s => s.id === 'db' ? { ...s, status: 'ok', msg: '连接成功 (Latency: 12ms)' } : s));
-      
-      await new Promise(r => setTimeout(r, 1000));
-      if(!isMounted) return;
-      const hasValidKey = Object.values(adminKeys).some(k => k.status === 'success' && k.value.length > 5);
-      if (hasValidKey) {
-         setCheckSteps(prev => prev.map(s => s.id === 'api' ? { ...s, status: 'ok', msg: '配置正常，多模型网关在线' } : s));
-      } else {
-         setCheckSteps(prev => prev.map(s => s.id === 'api' ? { ...s, status: 'error', msg: '警告：未检测到有效配置的 API Key！用户调度可能受阻' } : s));
+      try {
+        const res = await fetch(`${API_BASE_URL}/admin/health-check`, {
+          headers: { Authorization: `Bearer ${window.sessionStorage.getItem('token') || ''}` }
+        });
+        if (!isMounted) return;
+        if (res.ok) {
+          const data = await res.json();
+          (data.results || []).forEach(r => {
+            setCheckSteps(prev => prev.map(s => s.id === r.id ? { ...s, status: r.status, msg: r.msg } : s));
+          });
+        } else {
+          // 后端不可达时 fallback 到客户端检测
+          setCheckSteps(prev => prev.map(s => s.id === 'db' ? { ...s, status: 'error', msg: '后端服务不可达' } : s));
+          const hasValidKey = Object.values(adminKeys).some(k => k.status === 'success' && k.value.length > 5);
+          setCheckSteps(prev => prev.map(s => s.id === 'api' ? { ...s, status: hasValidKey ? 'ok' : 'error', msg: hasValidKey ? '本地 Key 配置存在' : '未检测到有效 API Key' } : s));
+          setCheckSteps(prev => prev.map(s => s.id === 'storage' ? { ...s, status: 'warn', msg: '无法检测（后端离线）' } : s));
+        }
+      } catch {
+        if (!isMounted) return;
+        setCheckSteps(prev => prev.map(s => ({ ...s, status: 'error', msg: '后端服务不可达' })));
       }
-
-      await new Promise(r => setTimeout(r, 600));
-      if(!isMounted) return;
-      setCheckSteps(prev => prev.map(s => s.id === 'storage' ? { ...s, status: 'ok', msg: '存储卷挂载正常，剩余容量 84%' } : s));
-
-      setCheckPhase('done');
+      if (isMounted) setCheckPhase('done');
     };
     runCheck();
     return () => { isMounted = false; };
@@ -254,15 +415,40 @@ const AdminApp = ({ auth, onLogout, dbUsers, setDbUsers, isTestMode, setIsTestMo
     if (checkPhase === 'done') {
       const hasError = checkSteps.some(s => s.status === 'error');
       if (hasError) {
-        setTimeout(() => {
+        const errorDetails = checkSteps.filter(s => s.status === 'error' || s.status === 'warn').map(s => `${s.name}: ${s.msg}`).join('\n');
+        // 尝试通过后端发送 Webhook 告警
+        fetch(`${API_BASE_URL}/admin/send-alert`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${window.sessionStorage.getItem('token') || ''}` },
+          body: JSON.stringify({ title: '系统自检异常告警', content: errorDetails }),
+        }).then(r => r.json()).then(data => {
+          const channels = (data.results || []).map(r => `${r.channel}(${r.ok ? 'OK' : 'FAIL'})`).join(', ');
           setAlertSent(true);
-          addLog('alert', 'System', '自检异常告警', `API 节点异常。已向配置的渠道投递告警：Email(${alertsConfig.email||'未配'}), SMS(${alertsConfig.phone||'未配'})`);
-        }, 1500);
+          addLog('alert', 'System', '自检异常告警', `${errorDetails}。Webhook: ${channels || '未配置'}`);
+        }).catch(() => {
+          setAlertSent(true);
+          addLog('alert', 'System', '自检异常告警', `${errorDetails}。Webhook 发送失败`);
+        });
       } else {
         setTimeout(() => setShowSelfCheck(false), 1500);
       }
     }
   }, [checkPhase, checkSteps]);
+
+  // 获取实时使用统计
+  useEffect(() => {
+    const fetchStats = async () => {
+      try {
+        const res = await fetch(`${API_BASE_URL}/admin/usage-stats`, {
+          headers: { Authorization: `Bearer ${window.sessionStorage.getItem('token') || ''}` }
+        });
+        if (res.ok) setUsageStats(await res.json());
+      } catch { /* ignore */ }
+    };
+    fetchStats();
+    const interval = setInterval(fetchStats, 30000); // 每 30 秒刷新
+    return () => clearInterval(interval);
+  }, []);
 
   const [newAdmin, setNewAdmin] = useState({ username: '', password: '', roleDetail: 'operator' });
   const handleAddAdmin = () => {
@@ -370,11 +556,12 @@ const AdminApp = ({ auth, onLogout, dbUsers, setDbUsers, isTestMode, setIsTestMo
                   <div className="mt-1">
                     {step.status === 'pending' && <div className="w-5 h-5 border-2 border-indigo-200 border-t-indigo-600 rounded-full animate-spin"/>}
                     {step.status === 'ok' && <CheckCircle2 className="text-green-500" size={20} />}
+                    {step.status === 'warn' && <AlertTriangle className="text-amber-500" size={20} />}
                     {step.status === 'error' && <AlertTriangle className="text-red-500" size={20} />}
                   </div>
                   <div>
                     <h4 className="font-bold text-gray-800">{step.name}</h4>
-                    <p className={`text-xs mt-1 ${step.status === 'error' ? 'text-red-500 font-medium' : 'text-gray-500'}`}>{step.msg || '正在校验中...'}</p>
+                    <p className={`text-xs mt-1 ${step.status === 'error' ? 'text-red-500 font-medium' : step.status === 'warn' ? 'text-amber-600 font-medium' : 'text-gray-500'}`}>{step.msg || '正在校验中...'}</p>
                   </div>
                 </div>
               ))}
@@ -402,13 +589,18 @@ const AdminApp = ({ auth, onLogout, dbUsers, setDbUsers, isTestMode, setIsTestMo
           <span className="text-lg font-black text-white tracking-wider">ADMIN PORTAL</span>
         </div>
         <nav className="flex-1 py-6 px-4 space-y-2 overflow-y-auto">
-          {[{id:'overview', icon: Activity, label: '数据看板'},
-            {id:'users', icon: Users, label: '用户管线'},
-            {id:'apikeys', icon: Key, label: '系统接口配置'},
-            {id:'admins', icon: UserCog, label: '管理员与权限'},
-            {id:'logs', icon: ClipboardList, label: '运行与告警日志'},
-            {id:'settings', icon: Sliders, label: '全局与告警设置'}
-          ].map(item => (
+          {[{id:'overview', icon: Activity, label: '数据看板', perm: 'admin.overview'},
+            {id:'users', icon: Users, label: '用户管线', perm: 'admin.users'},
+            {id:'apikeys', icon: Key, label: '系统接口配置', perm: 'admin.keys'},
+            {id:'vendors', icon: Server, label: '厂商与模型管理', perm: 'admin.models'},
+            {id:'admins', icon: UserCog, label: '管理员与权限', perm: 'admin.revoke'},
+            {id:'logs', icon: ClipboardList, label: '运行与告警日志', perm: 'admin.logs'},
+            {id:'settings', icon: Sliders, label: '全局与告警设置', perm: 'admin.settings'},
+            {id:'templates', icon: BookOpen, label: 'Prompt 模板', perm: 'admin.settings'},
+            {id:'workflow', icon: GitBranch, label: '工作流编排', perm: 'admin.settings'},
+            {id:'sla', icon: Shield, label: 'SLA 保障', perm: 'admin.settings'},
+            {id:'deploy', icon: Cloud, label: '私有化部署', perm: 'admin.settings'}
+          ].filter(item => !item.perm || (auth.permissions || []).includes(item.perm)).map(item => (
             <button key={item.id} onClick={() => setSubTab(item.id)} className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl transition-all ${subTab === item.id ? 'bg-indigo-600 text-white shadow-lg' : 'hover:bg-slate-800'}`}>
               <item.icon size={18} /> <span className="font-bold text-sm">{item.label}</span>
             </button>
@@ -439,9 +631,14 @@ const AdminApp = ({ auth, onLogout, dbUsers, setDbUsers, isTestMode, setIsTestMo
             {subTab === 'overview' && '数据中心'}
             {subTab === 'users' && '用户与订阅管理'}
             {subTab === 'apikeys' && '平台多模型接口配置'}
+            {subTab === 'vendors' && '厂商与模型管理'}
             {subTab === 'admins' && '管理员人员配置'}
             {subTab === 'logs' && '系统运行审计日志'}
             {subTab === 'settings' && '全局控制与告警'}
+            {subTab === 'templates' && 'Prompt 模板管理'}
+            {subTab === 'workflow' && '工作流编排引擎'}
+            {subTab === 'sla' && 'SLA 服务等级协议'}
+            {subTab === 'deploy' && '私有化部署管理'}
           </h2>
           <div className="flex items-center gap-4 text-xs font-medium">
             <span className="flex items-center gap-1"><MonitorDot className="text-green-500" size={14}/> DB在线</span>
@@ -451,13 +648,322 @@ const AdminApp = ({ auth, onLogout, dbUsers, setDbUsers, isTestMode, setIsTestMo
 
         <div className="p-8 pb-32">
           {subTab === 'overview' && (
-            <div className="grid grid-cols-4 gap-6">
-              {[{ label: '总注册量', v: dbUsers.length, c: 'text-blue-600', bg: 'bg-blue-100' }, { label: '今日调用量', v: 1284, c: 'text-indigo-600', bg: 'bg-indigo-100' }, { label: '可用 API 节点', v: Object.values(adminKeys).filter(k=>k.status==='success').length, c: 'text-emerald-600', bg: 'bg-emerald-100' }, { label: '自检状态', v: checkSteps.some(s=>s.status==='error')?'告警中':'健康', c: checkSteps.some(s=>s.status==='error')?'text-red-600':'text-green-600', bg: checkSteps.some(s=>s.status==='error')?'bg-red-100':'bg-green-100' }].map((st, i) => (
-                <div key={i} className="bg-white p-6 rounded-3xl border border-gray-200 shadow-sm flex items-center gap-4">
-                  <div className={`w-12 h-12 rounded-xl flex items-center justify-center ${st.bg} ${st.c}`}><Database size={20} /></div>
-                  <div><p className="text-xs text-gray-500 mb-1">{st.label}</p><p className="text-2xl font-black">{st.v}</p></div>
+            <div className="space-y-6">
+              {/* 顶部统计卡片 */}
+              <div className="grid grid-cols-4 gap-6">
+                {[
+                  { label: '总注册量', v: dbUsers.length, c: 'text-blue-600', bg: 'bg-blue-100' },
+                  { label: '今日调用量', v: usageStats?.today?.totalTasks ?? 0, c: 'text-indigo-600', bg: 'bg-indigo-100' },
+                  { label: '今日 Token', v: ((usageStats?.today?.totalTokensIn || 0) + (usageStats?.today?.totalTokensOut || 0)).toLocaleString(), c: 'text-emerald-600', bg: 'bg-emerald-100' },
+                  { label: '今日成本 (USD)', v: `$${(usageStats?.today?.totalCost || 0).toFixed(4)}`, c: checkSteps.some(s=>s.status==='error')?'text-red-600':'text-green-600', bg: checkSteps.some(s=>s.status==='error')?'bg-red-100':'bg-green-100' }
+                ].map((st, i) => (
+                  <div key={i} className="bg-white p-6 rounded-3xl border border-gray-200 shadow-sm flex items-center gap-4">
+                    <div className={`w-12 h-12 rounded-xl flex items-center justify-center ${st.bg} ${st.c}`}><Database size={20} /></div>
+                    <div><p className="text-xs text-gray-500 mb-1">{st.label}</p><p className="text-2xl font-black">{st.v}</p></div>
+                  </div>
+                ))}
+              </div>
+
+              {/* 7 日趋势图 (SVG 折线 + 面积图，支持 调用量/Token/成本 切换) */}
+              {usageStats?.trend && (() => {
+                const trend = usageStats.trend;
+                const trendViews = {
+                  tasks:  { label: '调用量',      getData: d => d.tasks, format: v => `${v}`, unit: '次' },
+                  tokens: { label: 'Token 用量',  getData: d => (d.tokensIn || 0) + (d.tokensOut || 0), format: v => v >= 1000 ? `${(v/1000).toFixed(1)}k` : `${v}`, unit: '' },
+                  cost:   { label: '成本 (USD)',   getData: d => d.cost,  format: v => `$${v.toFixed(3)}`, unit: '' },
+                };
+                const view = trendViews[trendTab] || trendViews.tasks;
+                const maxVal = Math.max(1, ...trend.map(d => view.getData(d)));
+                const lineColor = trendTab === 'tasks' ? '#6366f1' : trendTab === 'tokens' ? '#10b981' : '#f59e0b';
+                const W = 700, H = 150, PAD_TOP = 20, PAD_BOT = 24, CHART_H = H - PAD_TOP - PAD_BOT;
+                const getX = i => trend.length > 1 ? 40 + i * ((W - 80) / (trend.length - 1)) : W / 2;
+                const getY = d => PAD_TOP + CHART_H - (view.getData(d) / maxVal) * CHART_H;
+                const linePts = trend.map((d, i) => `${getX(i)},${getY(d)}`).join(' ');
+                const areaPts = `${getX(0)},${PAD_TOP + CHART_H} ${linePts} ${getX(trend.length - 1)},${PAD_TOP + CHART_H}`;
+                return (
+                  <div className="bg-white border border-gray-200 rounded-3xl p-6 shadow-sm">
+                    <div className="flex items-center justify-between mb-4">
+                      <h3 className="text-sm font-bold text-gray-800 flex items-center gap-2"><Activity size={16} className="text-indigo-500"/> 最近 7 天趋势</h3>
+                      <div className="flex gap-1 bg-gray-100 rounded-xl p-0.5">
+                        {Object.entries(trendViews).map(([key, v]) => (
+                          <button key={key} onClick={() => setTrendTab(key)}
+                            className={`px-3 py-1 text-[10px] font-bold rounded-lg transition-all ${trendTab === key ? 'bg-white shadow text-gray-800' : 'text-gray-500 hover:text-gray-700'}`}>
+                            {v.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <svg width="100%" viewBox={`0 0 ${W} ${H}`} className="overflow-visible">
+                      <defs>
+                        <linearGradient id={`areaGrad-${trendTab}`} x1="0" y1="0" x2="0" y2="1">
+                          <stop offset="0%" stopColor={lineColor} stopOpacity="0.25"/>
+                          <stop offset="100%" stopColor={lineColor} stopOpacity="0.02"/>
+                        </linearGradient>
+                      </defs>
+                      {[0, 0.25, 0.5, 0.75, 1].map(p => {
+                        const yVal = maxVal * p;
+                        const label = trendTab === 'cost' ? `$${yVal.toFixed(yVal < 0.1 ? 3 : 2)}` : yVal >= 1000 ? `${(yVal/1000).toFixed(1)}k` : Math.round(yVal);
+                        return (
+                          <g key={p}>
+                            <line x1="40" y1={PAD_TOP + CHART_H * (1 - p)} x2={W - 40} y2={PAD_TOP + CHART_H * (1 - p)} stroke="#f3f4f6" strokeWidth="1"/>
+                            <text x="36" y={PAD_TOP + CHART_H * (1 - p) + 3} textAnchor="end" fontSize="9" fill="#9ca3af">{label}</text>
+                          </g>
+                        );
+                      })}
+                      <polygon points={areaPts} fill={`url(#areaGrad-${trendTab})`}/>
+                      <polyline points={linePts} fill="none" stroke={lineColor} strokeWidth="2.5" strokeLinejoin="round" strokeLinecap="round"/>
+                      {trend.map((d, i) => (
+                        <g key={d.date}>
+                          <circle cx={getX(i)} cy={getY(d)} r="4" fill="white" stroke={lineColor} strokeWidth="2"/>
+                          <text x={getX(i)} y={getY(d) - 10} textAnchor="middle" fontSize="10" fontWeight="bold" fill="#374151">{view.format(view.getData(d))}</text>
+                          <text x={getX(i)} y={H - 2} textAnchor="middle" fontSize="9" fill="#9ca3af">{d.date.slice(5)}</text>
+                        </g>
+                      ))}
+                    </svg>
+                    {trendTab === 'tokens' && (
+                      <div className="flex gap-6 mt-2 text-xs">
+                        <span className="text-gray-500">7 日输入: <b className="text-emerald-600">{trend.reduce((s, d) => s + (d.tokensIn || 0), 0).toLocaleString()}</b></span>
+                        <span className="text-gray-500">7 日输出: <b className="text-blue-600">{trend.reduce((s, d) => s + (d.tokensOut || 0), 0).toLocaleString()}</b></span>
+                      </div>
+                    )}
+                    {trendTab === 'cost' && (
+                      <div className="flex gap-6 mt-2 text-xs">
+                        <span className="text-gray-500">7 日总成本: <b className="text-amber-600">${trend.reduce((s, d) => s + (d.cost || 0), 0).toFixed(4)}</b></span>
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+
+              {/* 用户排行 + 超额预警 */}
+              <div className="grid grid-cols-2 gap-6">
+                {usageStats?.ranking && (
+                  <div className="bg-white border border-gray-200 rounded-3xl p-6 shadow-sm">
+                    <h3 className="text-sm font-bold text-gray-800 mb-4 flex items-center gap-2"><Users size={16} className="text-indigo-500"/> 今日用量排行 <span className="text-[10px] text-gray-400 font-normal">Top 20</span></h3>
+                    {usageStats.ranking.length === 0 ? <p className="text-xs text-gray-400">暂无用户使用记录</p> : (
+                      <div className="overflow-hidden">
+                        <div className="grid grid-cols-[28px_1fr_52px_64px_72px_64px] gap-1 text-[10px] font-bold text-gray-400 uppercase mb-2 px-1">
+                          <span>#</span><span>用户</span><span>套餐</span><span className="text-right">调用</span><span className="text-right">Token</span><span className="text-right">成本</span>
+                        </div>
+                        <div className="space-y-1 max-h-80 overflow-y-auto">
+                          {usageStats.ranking.slice(0, 20).map((u, i) => (
+                            <div key={u.userId} className="grid grid-cols-[28px_1fr_52px_64px_72px_64px] gap-1 items-center text-xs py-1.5 px-1 rounded-lg hover:bg-gray-50">
+                              <span className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold ${i < 3 ? 'bg-amber-100 text-amber-700' : 'bg-gray-100 text-gray-500'}`}>{i+1}</span>
+                              <span className="font-medium text-gray-700 truncate">{u.username}</span>
+                              <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold text-center ${u.plan === 'pro' ? 'bg-blue-50 text-blue-600' : u.plan === 'enterprise' ? 'bg-amber-50 text-amber-600' : 'bg-gray-50 text-gray-500'}`}>{u.plan}</span>
+                              <span className="text-right font-bold text-indigo-600">{u.tasks}</span>
+                              <span className="text-right text-gray-500">{((u.tokensIn || 0) + (u.tokensOut || 0)) >= 1000 ? `${(((u.tokensIn || 0) + (u.tokensOut || 0)) / 1000).toFixed(1)}k` : (u.tokensIn || 0) + (u.tokensOut || 0)}</span>
+                              <span className="text-right font-bold text-emerald-600">${(u.cost || 0).toFixed(3)}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* 超额预警 */}
+                <div className="bg-white border border-gray-200 rounded-3xl p-6 shadow-sm">
+                  <h3 className="text-sm font-bold text-gray-800 mb-4 flex items-center gap-2"><AlertTriangle size={16} className="text-amber-500"/> 超额预警</h3>
+                  <div className="space-y-2">
+                    {(() => {
+                      const warnings = dbUsers.filter(u => u.role !== 'admin').map(u => {
+                        const ud = usageStats?.ranking?.find(r => r.userId === u.id);
+                        const limit = u.plan === 'free' ? 20 : u.plan === 'pro' ? 500 : -1;
+                        if (limit > 0 && ud && ud.tasks >= limit * 0.8) {
+                          return { ...u, tasks: ud.tasks, limit, pct: Math.round(ud.tasks / limit * 100) };
+                        }
+                        return null;
+                      }).filter(Boolean);
+                      if (warnings.length === 0) return <p className="text-xs text-gray-400">所有用户用量正常</p>;
+                      return warnings.map(w => (
+                        <div key={w.id} className={`p-3 rounded-xl border text-xs ${w.pct >= 100 ? 'bg-red-50 border-red-200' : 'bg-amber-50 border-amber-200'}`}>
+                          <div className="flex justify-between items-center mb-1">
+                            <span className="font-bold text-gray-700">{w.username}</span>
+                            <span className={`font-bold ${w.pct >= 100 ? 'text-red-600' : 'text-amber-600'}`}>{w.pct}%</span>
+                          </div>
+                          <div className="w-full h-1.5 bg-gray-200 rounded-full">
+                            <div className={`h-full rounded-full ${w.pct >= 100 ? 'bg-red-500' : 'bg-amber-500'}`} style={{width: `${Math.min(100, w.pct)}%`}}/>
+                          </div>
+                          <span className="text-gray-500 mt-1 block">{w.tasks}/{w.limit} 次（{w.plan.toUpperCase()}）</span>
+                        </div>
+                      ));
+                    })()}
+                  </div>
                 </div>
-              ))}
+              </div>
+
+              {/* 模型成本分布 (环形图 + 条形图) */}
+              {usageStats?.modelBreakdown && usageStats.modelBreakdown.length > 0 && (() => {
+                const data = usageStats.modelBreakdown;
+                const total = data.reduce((s, d) => s + d.cost, 0);
+                const COLORS = ['#6366f1', '#22c55e', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4', '#ec4899', '#14b8a6'];
+                return (
+                  <div className="bg-white border border-gray-200 rounded-3xl p-6 shadow-sm">
+                    <h3 className="text-sm font-bold text-gray-800 mb-4 flex items-center gap-2"><PieChart size={16} className="text-indigo-500"/> 今日模型成本分布</h3>
+                    <div className="flex gap-6">
+                      {/* 环形图 */}
+                      <div className="flex-shrink-0 flex items-center justify-center">
+                        <svg width="150" height="150" viewBox="0 0 150 150">
+                          {(() => {
+                            if (total === 0) return <text x="75" y="78" textAnchor="middle" fontSize="11" fill="#9ca3af">暂无数据</text>;
+                            const cx = 75, cy = 75, r = 58, inner = 36;
+                            let cum = -Math.PI / 2;
+                            return <>
+                              {data.map((d, i) => {
+                                const angle = Math.max(0.02, (d.cost / total) * Math.PI * 2);
+                                const sa = cum; cum += angle;
+                                const x1 = cx + r * Math.cos(sa), y1 = cy + r * Math.sin(sa);
+                                const x2 = cx + r * Math.cos(sa + angle), y2 = cy + r * Math.sin(sa + angle);
+                                const ix1 = cx + inner * Math.cos(sa + angle), iy1 = cy + inner * Math.sin(sa + angle);
+                                const ix2 = cx + inner * Math.cos(sa), iy2 = cy + inner * Math.sin(sa);
+                                const lg = angle > Math.PI ? 1 : 0;
+                                return <path key={i} d={`M${x1},${y1} A${r},${r} 0 ${lg},1 ${x2},${y2} L${ix1},${iy1} A${inner},${inner} 0 ${lg},0 ${ix2},${iy2} Z`} fill={COLORS[i % COLORS.length]} opacity={0.85}/>;
+                              })}
+                              <text x={cx} y={cy - 4} textAnchor="middle" fontSize="13" fontWeight="bold" fill="#374151">${total.toFixed(2)}</text>
+                              <text x={cx} y={cy + 11} textAnchor="middle" fontSize="9" fill="#9ca3af">总成本</text>
+                            </>;
+                          })()}
+                        </svg>
+                      </div>
+                      {/* 图例 + 条形图 */}
+                      <div className="flex-1 space-y-2 min-w-0">
+                        {data.map((m, i) => {
+                          const pct = total > 0 ? (m.cost / total * 100).toFixed(1) : '0';
+                          return (
+                            <div key={i} className="flex items-center gap-2 text-xs">
+                              <div className="w-2.5 h-2.5 rounded-full flex-shrink-0" style={{backgroundColor: COLORS[i % COLORS.length]}}/>
+                              <span className="w-28 font-medium text-gray-700 truncate">{m.vendor}/{m.model}</span>
+                              <div className="flex-1 bg-gray-100 rounded-full h-2 overflow-hidden">
+                                <div className="h-full rounded-full" style={{width: `${Math.max(2, pct)}%`, backgroundColor: COLORS[i % COLORS.length]}}/>
+                              </div>
+                              <span className="text-gray-400 w-12 text-right">{m.calls} 次</span>
+                              <span className="text-gray-400 w-10 text-right">{pct}%</span>
+                              <span className="font-bold text-indigo-600 w-16 text-right">${m.cost.toFixed(4)}</span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* 盈利分析面板 */}
+              {usageStats?.revenue && (
+                <div className="bg-white border border-gray-200 rounded-3xl p-6 shadow-sm">
+                  <h3 className="text-sm font-bold text-gray-800 mb-4 flex items-center gap-2"><DollarSign size={16} className="text-green-500"/> 盈利分析（本月）</h3>
+                  <div className="grid grid-cols-4 gap-4 mb-6">
+                    {[
+                      { label: '预估月收入', value: `$${usageStats.revenue.estimatedMonthly}`, bg: 'bg-green-50', color: 'text-green-600', Icon: TrendingUp },
+                      { label: '本月 API 成本', value: `$${usageStats.revenue.monthlyCost.toFixed(2)}`, bg: 'bg-red-50', color: 'text-red-500', Icon: Database },
+                      { label: '预估利润', value: `$${usageStats.revenue.monthlyProfit}`, bg: usageStats.revenue.monthlyProfit >= 0 ? 'bg-emerald-50' : 'bg-red-50', color: usageStats.revenue.monthlyProfit >= 0 ? 'text-emerald-600' : 'text-red-600', Icon: DollarSign },
+                      { label: '利润率', value: `${usageStats.revenue.margin.toFixed(1)}%`, bg: 'bg-indigo-50', color: 'text-indigo-600', Icon: PieChart },
+                    ].map((card, i) => (
+                      <div key={i} className={`${card.bg} rounded-2xl p-4`}>
+                        <div className="flex items-center gap-2 mb-2">
+                          <card.Icon size={14} className={card.color}/>
+                          <span className="text-[10px] font-bold text-gray-500 uppercase">{card.label}</span>
+                        </div>
+                        <p className={`text-xl font-black ${card.color}`}>{card.value}</p>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="grid grid-cols-2 gap-6">
+                    {/* 用户构成 */}
+                    <div>
+                      <h4 className="text-xs font-bold text-gray-500 mb-3 uppercase">用户构成</h4>
+                      <div className="space-y-2">
+                        {Object.entries(usageStats.revenue.planCounts).map(([plan, count]) => {
+                          const tot = Object.values(usageStats.revenue.planCounts).reduce((s, v) => s + v, 0);
+                          const pct = tot > 0 ? (count / tot * 100).toFixed(0) : '0';
+                          const clr = { free: '#9ca3af', pro: '#6366f1', enterprise: '#f59e0b' }[plan] || '#ccc';
+                          return (
+                            <div key={plan} className="flex items-center gap-2 text-sm">
+                              <div className="w-2.5 h-2.5 rounded-full" style={{backgroundColor: clr}}/>
+                              <span className="text-xs font-medium text-gray-700 w-20 uppercase">{plan}</span>
+                              <div className="flex-1 bg-gray-100 rounded-full h-2 overflow-hidden">
+                                <div className="h-full rounded-full" style={{width: `${pct}%`, backgroundColor: clr}}/>
+                              </div>
+                              <span className="text-xs font-bold text-gray-600 w-12 text-right">{count} 人</span>
+                              <span className="text-[10px] text-gray-400 w-8 text-right">{pct}%</span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                    {/* 收入来源 */}
+                    <div>
+                      <h4 className="text-xs font-bold text-gray-500 mb-3 uppercase">收入来源</h4>
+                      <div className="space-y-2">
+                        {Object.entries(usageStats.revenue.breakdown).filter(([, v]) => v > 0).length === 0
+                          ? <p className="text-xs text-gray-400">暂无付费用户</p>
+                          : Object.entries(usageStats.revenue.breakdown).filter(([, v]) => v > 0).map(([plan, amount]) => {
+                            const tot = usageStats.revenue.estimatedMonthly;
+                            const pct = tot > 0 ? (amount / tot * 100).toFixed(0) : '0';
+                            const clr = { free: '#9ca3af', pro: '#6366f1', enterprise: '#f59e0b' }[plan] || '#ccc';
+                            return (
+                              <div key={plan} className="flex items-center gap-2 text-sm">
+                                <div className="w-2.5 h-2.5 rounded-full" style={{backgroundColor: clr}}/>
+                                <span className="text-xs font-medium text-gray-700 w-20 uppercase">{plan}</span>
+                                <div className="flex-1 bg-gray-100 rounded-full h-2 overflow-hidden">
+                                  <div className="h-full rounded-full" style={{width: `${pct}%`, backgroundColor: clr}}/>
+                                </div>
+                                <span className="text-xs font-bold text-gray-600 w-14 text-right">${amount}</span>
+                                <span className="text-[10px] text-gray-400 w-8 text-right">{pct}%</span>
+                              </div>
+                            );
+                          })
+                        }
+                      </div>
+                    </div>
+                  </div>
+                  <div className="mt-4 pt-4 border-t border-gray-100 flex flex-wrap gap-6 text-xs text-gray-500">
+                    <span>本月调用: <b className="text-gray-700">{(usageStats.revenue.monthlyTasks || 0).toLocaleString()}</b> 次</span>
+                    <span>本月 Token: <b className="text-gray-700">{((usageStats.revenue.monthlyTokensIn || 0) + (usageStats.revenue.monthlyTokensOut || 0)).toLocaleString()}</b></span>
+                    <span>付费用户: <b className="text-indigo-600">{(usageStats.revenue.planCounts?.pro || 0) + (usageStats.revenue.planCounts?.enterprise || 0)}</b> 人</span>
+                  </div>
+                </div>
+              )}
+
+              {/* 并发监控 */}
+              <div className="bg-white border border-gray-200 rounded-3xl p-6 shadow-sm">
+                <h3 className="text-sm font-bold text-gray-800 mb-4 flex items-center gap-2"><Zap size={16} className="text-amber-500"/> 实时并发监控</h3>
+                {(() => {
+                  const concurrent = usageStats?.concurrency;
+                  const activeUsers = concurrent?.active ? Object.entries(concurrent.active) : [];
+                  const totalActive = concurrent?.queueLength || 0;
+                  return (
+                    <div>
+                      <div className="flex items-center gap-4 mb-4">
+                        <div className="px-4 py-2 bg-indigo-50 rounded-xl">
+                          <span className="text-xs text-gray-500">活跃请求</span>
+                          <p className="text-xl font-black text-indigo-600">{totalActive}</p>
+                        </div>
+                        <div className="px-4 py-2 bg-gray-50 rounded-xl">
+                          <span className="text-xs text-gray-500">活跃用户</span>
+                          <p className="text-xl font-black text-gray-700">{activeUsers.length}</p>
+                        </div>
+                      </div>
+                      {activeUsers.length > 0 ? (
+                        <div className="space-y-2">
+                          {activeUsers.map(([uid, count]) => {
+                            const u = dbUsers.find(u => u.id === uid);
+                            return (
+                              <div key={uid} className="flex items-center gap-2 text-sm p-2 bg-gray-50 rounded-xl">
+                                <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse" />
+                                <span className="font-medium text-gray-700">{u?.username || uid}</span>
+                                <span className="text-xs text-gray-400">({u?.plan || 'free'})</span>
+                                <span className="ml-auto text-xs font-bold text-indigo-600">{count} 个并发请求</span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      ) : <p className="text-xs text-gray-400">当前无活跃请求</p>}
+                    </div>
+                  );
+                })()}
+              </div>
             </div>
           )}
 
@@ -518,7 +1024,16 @@ const AdminApp = ({ auth, onLogout, dbUsers, setDbUsers, isTestMode, setIsTestMo
                         </td>
                         <td className="px-6 py-4"><span className="text-green-600 font-bold text-xs flex items-center gap-1"><div className="w-1.5 h-1.5 rounded-full bg-green-600"></div>正常</span></td>
                         <td className="px-6 py-4">
-                          <button className="text-xs font-bold text-red-500 hover:underline disabled:opacity-30 cursor-not-allowed" disabled title="演示环境不允许删除管理员">撤销权限</button>
+                          <button
+                            className={`text-xs font-bold hover:underline ${u.username === auth.username ? 'text-gray-300 cursor-not-allowed' : 'text-red-500'}`}
+                            disabled={u.username === auth.username}
+                            title={u.username === auth.username ? '不能撤销自己的权限' : '将该管理员降级为普通用户'}
+                            onClick={() => {
+                              if (!confirm(`确定撤销「${u.username}」的管理员权限？该账号将变为普通用户。`)) return;
+                              setDbUsers(prev => prev.map(x => x.id === u.id ? { ...x, role: 'user', roleDetail: 'user', plan: 'free' } : x));
+                              addLog('warn', auth.username, '撤销管理员', `撤销了 ${u.username} 的管理员权限`);
+                            }}
+                          >撤销权限</button>
                         </td>
                       </tr>
                     ))}
@@ -532,8 +1047,9 @@ const AdminApp = ({ auth, onLogout, dbUsers, setDbUsers, isTestMode, setIsTestMo
             <div className="space-y-6">
               <div className="flex justify-between items-center bg-white p-4 rounded-2xl border border-gray-200 shadow-sm">
                 <div className="flex gap-2 text-sm">
-                  <span className="px-3 py-1.5 bg-gray-100 text-gray-700 rounded-lg font-bold border border-gray-200">全部日志</span>
-                  <span className="px-3 py-1.5 text-gray-500 hover:bg-gray-50 rounded-lg cursor-pointer">告警记录</span>
+                  {[{k:'all',l:'全部日志'},{k:'alert',l:'告警'},{k:'warn',l:'警告'},{k:'info',l:'操作'}].map(f => (
+                    <button key={f.k} onClick={() => setLogFilter(f.k)} className={`px-3 py-1.5 rounded-lg font-bold border transition-colors ${logFilter === f.k ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-gray-100 text-gray-600 border-gray-200 hover:bg-gray-200'}`}>{f.l}</button>
+                  ))}
                 </div>
                 <button onClick={handleExportLogs} className="flex items-center gap-2 px-4 py-2 bg-indigo-50 text-indigo-700 font-bold text-sm rounded-lg hover:bg-indigo-100 transition-colors">
                   <Download size={16} /> 导出日志 (CSV)
@@ -546,10 +1062,10 @@ const AdminApp = ({ auth, onLogout, dbUsers, setDbUsers, isTestMode, setIsTestMo
                     <tr><th className="px-6 py-4">发生时间</th><th className="px-6 py-4">级别</th><th className="px-6 py-4">操作者</th><th className="px-6 py-4">动作</th><th className="px-6 py-4">详细信息</th></tr>
                   </thead>
                   <tbody className="divide-y divide-gray-100">
-                    {dbLogs.length === 0 ? (
-                      <tr><td colSpan="5" className="px-6 py-8 text-center text-gray-400">暂无任何系统日志</td></tr>
+                    {(() => { const filtered = logFilter === 'all' ? dbLogs : dbLogs.filter(l => l.type === logFilter); return filtered.length === 0 ? (
+                      <tr><td colSpan="5" className="px-6 py-8 text-center text-gray-400">暂无{logFilter === 'all' ? '任何' : logFilter}系统日志</td></tr>
                     ) : (
-                      dbLogs.map(l => (
+                      filtered.map(l => (
                         <tr key={l.id} className="hover:bg-gray-50">
                           <td className="px-6 py-4 text-xs font-mono text-gray-500">{l.timestamp}</td>
                           <td className="px-6 py-4">
@@ -562,7 +1078,7 @@ const AdminApp = ({ auth, onLogout, dbUsers, setDbUsers, isTestMode, setIsTestMo
                           <td className="px-6 py-4 text-xs text-gray-600 max-w-md truncate" title={l.detail}>{l.detail}</td>
                         </tr>
                       ))
-                    )}
+                    ); })()}
                   </tbody>
                 </table>
               </div>
@@ -575,7 +1091,7 @@ const AdminApp = ({ auth, onLogout, dbUsers, setDbUsers, isTestMode, setIsTestMo
                  <AlertTriangle size={18} className="mt-0.5 flex-shrink-0" />
                  <p>为保障数据安全，以下所有配置将<strong>直接写入您的 Node.js 后端本地数据库（如 backend/data/*.json 或 MySQL）</strong>，绝不泄露在前端代码或浏览器中。保证您的云端资产绝对安全。</p>
                </div>
-              {VENDORS.map(v => {
+              {vendors.map(v => {
                 const kSt = adminKeys[v.id] || { value: '', status: 'idle', msg: '' };
                 return (
                   <div key={v.id} className="bg-white border border-gray-200 rounded-xl p-4 shadow-sm">
@@ -601,6 +1117,81 @@ const AdminApp = ({ auth, onLogout, dbUsers, setDbUsers, isTestMode, setIsTestMo
             </div>
           )}
 
+          {subTab === 'vendors' && (
+            <div className="max-w-4xl space-y-6">
+              <div className="flex items-center justify-between">
+                <p className="text-sm text-gray-500">管理平台支持的 AI 厂商及其可用模型列表，修改后将实时同步至所有用户的模型选择下拉框。</p>
+                <button onClick={() => { setEditingVendor('__new__'); setVendorForm({ id: '', name: '', region: 'CN', models: '' }); }} className="px-4 py-2 bg-indigo-600 text-white rounded-lg font-bold text-sm flex items-center gap-2 hover:bg-indigo-700 transition-colors shadow"><Plus size={16}/> 添加厂商</button>
+              </div>
+
+              {editingVendor && (
+                <div className="bg-white border-2 border-indigo-300 rounded-xl p-6 shadow-md">
+                  <h4 className="font-bold text-gray-800 mb-4 flex items-center gap-2"><Server size={18} className="text-indigo-500"/> {editingVendor === '__new__' ? '新增厂商' : `编辑: ${editingVendor.name}`}</h4>
+                  <div className="grid grid-cols-2 gap-4 mb-4">
+                    <div>
+                      <label className="block text-xs font-bold text-gray-600 mb-1">厂商 ID（唯一标识，小写英文）</label>
+                      <input className="w-full text-sm p-2.5 border border-gray-300 rounded-lg" placeholder="例: openai" value={vendorForm.id} onChange={e => setVendorForm(p => ({...p, id: e.target.value.toLowerCase().replace(/[^a-z0-9_-]/g, '')}))} disabled={editingVendor !== '__new__'} />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-bold text-gray-600 mb-1">显示名称</label>
+                      <input className="w-full text-sm p-2.5 border border-gray-300 rounded-lg" placeholder="例: OpenAI" value={vendorForm.name} onChange={e => setVendorForm(p => ({...p, name: e.target.value}))} />
+                    </div>
+                  </div>
+                  <div className="mb-4">
+                    <label className="block text-xs font-bold text-gray-600 mb-1">区域</label>
+                    <select className="w-full text-sm p-2.5 border border-gray-300 rounded-lg bg-white" value={vendorForm.region} onChange={e => setVendorForm(p => ({...p, region: e.target.value}))}>
+                      <option value="US">US（海外）</option>
+                      <option value="CN">CN（国内）</option>
+                    </select>
+                  </div>
+                  <div className="mb-4">
+                    <label className="block text-xs font-bold text-gray-600 mb-1">模型列表（每行一个模型名，或用英文逗号分隔）</label>
+                    <textarea className="w-full text-sm p-2.5 border border-gray-300 rounded-lg font-mono" rows={4} placeholder="gpt-4.1&#10;gpt-4.1-mini&#10;gpt-4o" value={vendorForm.models} onChange={e => setVendorForm(p => ({...p, models: e.target.value}))} />
+                  </div>
+                  <div className="flex gap-3">
+                    <button onClick={() => {
+                      const modelsArr = vendorForm.models.split(/[,\n]/).map(s => s.trim()).filter(Boolean);
+                      if (!vendorForm.id || !vendorForm.name || modelsArr.length === 0) { alert('请填写完整的厂商 ID、名称和至少一个模型'); return; }
+                      const newV = { id: vendorForm.id, name: vendorForm.name, region: vendorForm.region, models: modelsArr };
+                      if (editingVendor === '__new__') {
+                        if (vendors.some(v => v.id === vendorForm.id)) { alert('厂商 ID 已存在'); return; }
+                        setVendors(prev => [...prev, newV]);
+                        addLog('info', auth.username, '厂商配置', `新增厂商 ${newV.name}（${modelsArr.length} 个模型）`);
+                      } else {
+                        setVendors(prev => prev.map(v => v.id === editingVendor.id ? newV : v));
+                        addLog('info', auth.username, '厂商配置', `编辑厂商 ${newV.name}（${modelsArr.length} 个模型）`);
+                      }
+                      setEditingVendor(null);
+                    }} className="px-5 py-2 bg-indigo-600 text-white rounded-lg font-bold text-sm hover:bg-indigo-700 transition-colors flex items-center gap-2"><Save size={14}/> 保存</button>
+                    <button onClick={() => setEditingVendor(null)} className="px-5 py-2 bg-gray-200 text-gray-700 rounded-lg font-bold text-sm hover:bg-gray-300 transition-colors">取消</button>
+                  </div>
+                </div>
+              )}
+
+              {vendors.map(v => (
+                <div key={v.id} className="bg-white border border-gray-200 rounded-xl p-5 shadow-sm hover:shadow-md transition-shadow">
+                  <div className="flex items-center justify-between mb-3">
+                    <div className="flex items-center gap-3">
+                      <Server size={18} className="text-indigo-500"/>
+                      <h4 className="font-bold text-gray-800">{v.name}</h4>
+                      <span className={`text-[10px] px-2 py-0.5 rounded font-bold ${v.region === 'US' ? 'bg-blue-100 text-blue-700' : 'bg-emerald-100 text-emerald-700'}`}>{v.region}</span>
+                      <span className="text-[10px] px-2 py-0.5 bg-gray-100 text-gray-500 rounded">ID: {v.id}</span>
+                    </div>
+                    <div className="flex gap-2">
+                      <button onClick={() => { setEditingVendor(v); setVendorForm({ id: v.id, name: v.name, region: v.region, models: v.models.join('\n') }); }} className="px-3 py-1.5 text-xs font-bold text-indigo-600 bg-indigo-50 rounded-lg hover:bg-indigo-100 transition-colors">编辑</button>
+                      <button onClick={() => { if (vendors.length <= 1) { alert('至少保留一个厂商'); return; } if (!confirm(`确定删除厂商「${v.name}」？删除后不可恢复。`)) return; setVendors(prev => prev.filter(x => x.id !== v.id)); addLog('warn', auth.username, '厂商配置', `删除厂商 ${v.name}`); }} className="px-3 py-1.5 text-xs font-bold text-red-600 bg-red-50 rounded-lg hover:bg-red-100 transition-colors">删除</button>
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    {v.models.map(m => (
+                      <span key={m} className="text-xs px-2.5 py-1 bg-indigo-50 text-indigo-700 rounded-lg font-mono">{m}</span>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
           {subTab === 'settings' && (
             <div className="max-w-4xl space-y-8">
               <div className="bg-white border border-gray-200 rounded-3xl p-8 shadow-sm">
@@ -613,6 +1204,19 @@ const AdminApp = ({ auth, onLogout, dbUsers, setDbUsers, isTestMode, setIsTestMo
                   <button onClick={() => { setIsTestMode(!isTestMode); addLog('warn', auth.username, '系统模式切换', `将运行模式切换为了: ${!isTestMode ? '测试阶段' : '生产收费'}`); }} className={`px-6 py-3 rounded-xl font-bold transition-all ${isTestMode ? 'bg-amber-500 hover:bg-amber-600 text-white' : 'bg-indigo-600 hover:bg-indigo-700 text-white'}`}>
                     {isTestMode ? '结束测试，切生产' : '开启测试运行阶段'}
                   </button>
+                </div>
+              </div>
+
+              <div className="bg-white border border-gray-200 rounded-3xl p-8 shadow-sm">
+                <h3 className="text-lg font-black text-gray-800 mb-6 flex items-center gap-2"><ShieldCheck className="text-indigo-600"/> 终审策略</h3>
+                <p className="text-sm text-gray-500 mb-4">配置四级流水线的终审输出策略，该设置对所有用户生效。</p>
+                <div className="grid grid-cols-2 gap-3">
+                  {STRATEGIES.map(s => (
+                    <button key={s.id} onClick={() => { setStrategy(s.id); addLog('info', auth.username, '策略变更', `终审策略设为「${s.name}」`); }} className={`p-4 rounded-xl border-2 text-left transition-all ${strategy === s.id ? 'border-indigo-500 bg-indigo-50 shadow-md' : 'border-gray-200 bg-white hover:border-gray-300'}`}>
+                      <div className={`text-sm font-bold mb-1 ${strategy === s.id ? 'text-indigo-700' : 'text-gray-800'}`}>{strategy === s.id && '✓ '}{s.name}</div>
+                      <div className="text-xs text-gray-500">{s.desc}</div>
+                    </button>
+                  ))}
                 </div>
               </div>
 
@@ -645,13 +1249,263 @@ const AdminApp = ({ auth, onLogout, dbUsers, setDbUsers, isTestMode, setIsTestMo
 
                   <div className="p-5 bg-gray-50 border border-gray-200 rounded-xl">
                     <h4 className="font-bold text-sm text-gray-700 flex items-center gap-2 mb-4"><MessageSquare size={16}/> 企业微信 / 钉钉 Webhook</h4>
-                    <input type="text" value={alertsConfig.wechat || ''} onChange={e=>setAlertsConfig({...alertsConfig, wechat: e.target.value})} className="w-full p-3 bg-white border border-gray-200 rounded-lg text-sm outline-none focus:border-indigo-500" placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..." />
+                    <div className="space-y-3">
+                      <input type="text" value={alertsConfig.webhookWechat || ''} onChange={e=>setAlertsConfig({...alertsConfig, webhookWechat: e.target.value})} className="w-full p-3 bg-white border border-gray-200 rounded-lg text-sm outline-none focus:border-indigo-500" placeholder="企业微信 Webhook: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..." />
+                      <input type="text" value={alertsConfig.webhookDingtalk || ''} onChange={e=>setAlertsConfig({...alertsConfig, webhookDingtalk: e.target.value})} className="w-full p-3 bg-white border border-gray-200 rounded-lg text-sm outline-none focus:border-indigo-500" placeholder="钉钉 Webhook: https://oapi.dingtalk.com/robot/send?access_token=..." />
+                    </div>
                   </div>
 
-                  <div className="pt-2 flex justify-end">
-                    <button onClick={() => { addLog('info', auth.username, '修改告警配置', '保存了最新的告警通信渠道参数'); alert('告警集成配置已加密保存到本地数据库！'); }} className="flex items-center gap-2 px-6 py-3 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-xl shadow-md transition-colors"><Save size={16}/> 保存集成配置</button>
+                  <div className="pt-2 flex gap-3 justify-end">
+                    <button onClick={async () => {
+                      try {
+                        const r = await fetch(`${API_BASE_URL}/admin/send-alert`, {
+                          method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${window.sessionStorage.getItem('token') || ''}` },
+                          body: JSON.stringify({ title: 'Webhook 测试', content: '这是一条来自 ZDF.AI 管理后台的测试告警。如果收到说明 Webhook 配置正确。' }),
+                        });
+                        const data = await r.json();
+                        if (data.results?.length > 0) {
+                          const summary = data.results.map(r => `${r.channel}: ${r.ok ? 'OK' : r.msg}`).join('\n');
+                          alert('Webhook 测试结果:\n' + summary);
+                        } else { alert(data.error || '未配置 Webhook URL'); }
+                      } catch { alert('发送失败，请检查后端是否在线'); }
+                    }} className="flex items-center gap-2 px-5 py-3 bg-amber-500 hover:bg-amber-600 text-white font-bold rounded-xl shadow-md transition-colors"><BellRing size={16}/> 测试 Webhook</button>
+                    <button onClick={async () => {
+                      try {
+                        await fetch(`${API_BASE_URL}/admin/settings`, {
+                          method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${window.sessionStorage.getItem('token') || ''}` },
+                          body: JSON.stringify({ alertsConfig }),
+                        });
+                        addLog('info', auth.username, '修改告警配置', '保存了最新的告警通信渠道参数');
+                        alert('告警集成配置已保存！');
+                      } catch { alert('保存失败'); }
+                    }} className="flex items-center gap-2 px-6 py-3 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-xl shadow-md transition-colors"><Save size={16}/> 保存集成配置</button>
                   </div>
                 </div>
+              </div>
+            </div>
+          )}
+
+          {subTab === 'templates' && (
+            <div className="max-w-5xl space-y-6">
+              {/* 添加 / 编辑表单 */}
+              <div className="bg-white border border-gray-200 rounded-3xl p-8 shadow-sm">
+                <h3 className="text-lg font-black text-gray-800 mb-4 flex items-center gap-2">
+                  <BookOpen className="text-indigo-600" size={20}/> {editTpl ? '编辑模板' : '新增模板'}
+                </h3>
+                <div className="grid grid-cols-2 gap-4 mb-4">
+                  <div>
+                    <label className="block text-xs font-bold text-gray-600 mb-1">模板标题</label>
+                    <input value={editTpl ? editTpl.title : newTpl.title} onChange={e => editTpl ? setEditTpl({...editTpl, title: e.target.value}) : setNewTpl({...newTpl, title: e.target.value})} className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm" placeholder="如：商业报告生成"/>
+                  </div>
+                  <div className="flex gap-4">
+                    <div className="flex-1">
+                      <label className="block text-xs font-bold text-gray-600 mb-1">分类</label>
+                      <select value={editTpl ? editTpl.category : newTpl.category} onChange={e => editTpl ? setEditTpl({...editTpl, category: e.target.value}) : setNewTpl({...newTpl, category: e.target.value})} className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm">
+                        {['通用','写作','分析','编程','翻译','决策','创意','企业'].map(c => <option key={c} value={c}>{c}</option>)}
+                      </select>
+                    </div>
+                    <div className="flex-1">
+                      <label className="block text-xs font-bold text-gray-600 mb-1">最低套餐</label>
+                      <select value={editTpl ? editTpl.plan : newTpl.plan} onChange={e => editTpl ? setEditTpl({...editTpl, plan: e.target.value}) : setNewTpl({...newTpl, plan: e.target.value})} className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm">
+                        <option value="free">Free</option>
+                        <option value="pro">Pro</option>
+                        <option value="enterprise">Enterprise</option>
+                      </select>
+                    </div>
+                  </div>
+                </div>
+                <div className="mb-4">
+                  <label className="block text-xs font-bold text-gray-600 mb-1">Prompt 内容 <span className="text-gray-400 font-normal">（用 {'{input}'} 表示用户输入占位）</span></label>
+                  <textarea value={editTpl ? editTpl.prompt : newTpl.prompt} onChange={e => editTpl ? setEditTpl({...editTpl, prompt: e.target.value}) : setNewTpl({...newTpl, prompt: e.target.value})} rows={4} className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm font-mono" placeholder="请根据以下内容...&#10;{input}"/>
+                </div>
+                <div className="flex gap-3">
+                  <button onClick={async () => {
+                    const tpl = editTpl || newTpl;
+                    if (!tpl.title || !tpl.prompt) { alert('请填写标题和 Prompt 内容'); return; }
+                    try {
+                      const r = await fetch(`${API_BASE_URL}/admin/prompt-templates`, {
+                        method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${window.sessionStorage.getItem('token') || ''}` },
+                        body: JSON.stringify(tpl)
+                      });
+                      const d = await r.json();
+                      if (d.ok && d.template) {
+                        setAdminTemplates(prev => {
+                          const idx = prev.findIndex(t => t.id === d.template.id);
+                          return idx >= 0 ? prev.map((t,i) => i === idx ? d.template : t) : [...prev, d.template];
+                        });
+                        addLog('info', auth.username, editTpl ? '编辑模板' : '新增模板', `模板: ${tpl.title}`);
+                        setEditTpl(null);
+                        setNewTpl({ title: '', prompt: '', category: '通用', plan: 'free' });
+                      }
+                    } catch { alert('保存失败，请检查网络'); }
+                  }} className="px-5 py-2 bg-indigo-600 text-white rounded-lg text-sm font-bold hover:bg-indigo-700">
+                    {editTpl ? '更新模板' : '添加模板'}
+                  </button>
+                  {editTpl && <button onClick={() => setEditTpl(null)} className="px-5 py-2 bg-gray-200 text-gray-700 rounded-lg text-sm font-bold hover:bg-gray-300">取消编辑</button>}
+                </div>
+              </div>
+
+              {/* 模板列表 */}
+              <div className="bg-white border border-gray-200 rounded-3xl p-8 shadow-sm">
+                <h3 className="text-lg font-black text-gray-800 mb-4">已有模板 ({adminTemplates.length})</h3>
+                {adminTemplates.length === 0 ? (
+                  <p className="text-sm text-gray-400 py-8 text-center">暂无 Prompt 模板，请在上方添加</p>
+                ) : (
+                  <div className="space-y-3">
+                    {adminTemplates.map(tpl => (
+                      <div key={tpl.id} className="flex items-start gap-4 p-4 border border-gray-100 rounded-2xl hover:bg-gray-50 transition-colors">
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2 mb-1">
+                            <span className="font-bold text-gray-800 text-sm">{tpl.title}</span>
+                            <span className="px-2 py-0.5 text-[10px] rounded-full bg-indigo-100 text-indigo-700 font-bold">{tpl.category}</span>
+                            <span className={`px-2 py-0.5 text-[10px] rounded-full font-bold ${tpl.plan === 'free' ? 'bg-green-100 text-green-700' : tpl.plan === 'pro' ? 'bg-blue-100 text-blue-700' : 'bg-purple-100 text-purple-700'}`}>{tpl.plan}</span>
+                          </div>
+                          <p className="text-xs text-gray-500 truncate">{tpl.prompt.slice(0, 120)}...</p>
+                        </div>
+                        <div className="flex items-center gap-2 shrink-0">
+                          <button onClick={() => setEditTpl({...tpl})} className="px-3 py-1.5 text-xs bg-gray-100 hover:bg-gray-200 rounded-lg font-bold text-gray-600">编辑</button>
+                          <button onClick={async () => {
+                            if (!confirm(`确认删除模板「${tpl.title}」？`)) return;
+                            try {
+                              await fetch(`${API_BASE_URL}/admin/prompt-templates/${tpl.id}`, { method: 'DELETE', headers: { Authorization: `Bearer ${window.sessionStorage.getItem('token') || ''}` } });
+                              setAdminTemplates(prev => prev.filter(t => t.id !== tpl.id));
+                              addLog('warn', auth.username, '删除模板', `删除模板: ${tpl.title}`);
+                            } catch { alert('删除失败'); }
+                          }} className="px-3 py-1.5 text-xs bg-red-50 hover:bg-red-100 rounded-lg font-bold text-red-600">删除</button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {subTab === 'workflow' && (
+            <div className="max-w-4xl space-y-6">
+              <div className="bg-white border border-gray-200 rounded-3xl p-8 shadow-sm">
+                <h3 className="text-lg font-black text-gray-800 mb-2 flex items-center gap-2"><GitBranch className="text-indigo-600" size={20}/> 工作流编排引擎</h3>
+                <p className="text-sm text-gray-500 mb-6">可视化配置 AI 多步骤工作流，支持条件分支、循环、并行节点，将复杂业务流程转化为自动化流水线。</p>
+                <div className="grid grid-cols-3 gap-4 mb-6">
+                  {[
+                    { title: '顺序流水线', desc: 'A → B → C → D 依次执行，上一步输出作为下一步输入', status: '已内置' },
+                    { title: '条件分支', desc: '根据中间结果动态选择后续路径（如置信度 < 0.8 走人工审核）', status: '规划中' },
+                    { title: '并行节点', desc: '多个模型同时运行同一任务，结果合并投票', status: '规划中' },
+                    { title: '循环迭代', desc: '不满足质量阈值时自动重试，最多 N 轮', status: '规划中' },
+                    { title: '人工审批节点', desc: '在流水线中插入人工审批环节，支持超时自动放行', status: '规划中' },
+                    { title: '外部 API 调用', desc: '在流程中调用第三方 REST API 获取实时数据', status: '规划中' },
+                  ].map((f, i) => (
+                    <div key={i} className={`p-4 rounded-2xl border-2 ${f.status === '已内置' ? 'border-green-200 bg-green-50' : 'border-gray-200 bg-gray-50'}`}>
+                      <div className="flex items-center justify-between mb-2">
+                        <span className="font-bold text-sm text-gray-800">{f.title}</span>
+                        <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold ${f.status === '已内置' ? 'bg-green-200 text-green-700' : 'bg-gray-200 text-gray-500'}`}>{f.status}</span>
+                      </div>
+                      <p className="text-xs text-gray-500">{f.desc}</p>
+                    </div>
+                  ))}
+                </div>
+                <div className="p-6 border-2 border-dashed border-indigo-200 rounded-2xl bg-indigo-50/50 text-center">
+                  <GitBranch className="mx-auto text-indigo-300 mb-3" size={40} />
+                  <p className="text-sm font-bold text-indigo-600 mb-1">可视化工作流编辑器</p>
+                  <p className="text-xs text-indigo-400">拖拽节点构建自定义 AI 工作流 — Enterprise 专属功能，即将上线</p>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {subTab === 'sla' && (
+            <div className="max-w-4xl space-y-6">
+              <div className="bg-white border border-gray-200 rounded-3xl p-8 shadow-sm">
+                <h3 className="text-lg font-black text-gray-800 mb-2 flex items-center gap-2"><Shield className="text-indigo-600" size={20}/> SLA 服务等级协议</h3>
+                <p className="text-sm text-gray-500 mb-6">为企业客户提供可量化的服务保障承诺，包含可用性、响应时间、数据安全等核心指标。</p>
+                <div className="space-y-4">
+                  {[
+                    { metric: '平台可用性', target: '99.9%', current: '统计中...', desc: '每月允许最大停机时间 43 分钟' },
+                    { metric: 'API 平均响应时间', target: '\u003C 2s (P95)', current: '统计中...', desc: '从请求发出到首 Token 返回的延迟' },
+                    { metric: '数据保留期', target: '永久', current: 'Enterprise', desc: '企业版历史记录与审计日志永久保留' },
+                    { metric: '故障恢复时间 (RTO)', target: '\u003C 1h', current: '—', desc: '发生重大故障后恢复服务的目标时间' },
+                    { metric: '数据恢复点 (RPO)', target: '\u003C 15min', current: '—', desc: '发生故障时最大可接受的数据丢失时间窗口' },
+                    { metric: '专属技术支持', target: '7×24h', current: '—', desc: '企业客户拥有专属客户成功经理与工程师团队' },
+                  ].map((s, i) => (
+                    <div key={i} className="flex items-center justify-between p-4 bg-gray-50 rounded-2xl border border-gray-200">
+                      <div className="flex-1">
+                        <div className="flex items-center gap-2">
+                          <span className="font-bold text-sm text-gray-800">{s.metric}</span>
+                          <span className="text-[10px] px-2 py-0.5 bg-indigo-100 text-indigo-600 rounded-full font-bold">目标: {s.target}</span>
+                        </div>
+                        <p className="text-xs text-gray-400 mt-0.5">{s.desc}</p>
+                      </div>
+                      <span className="text-sm font-mono text-gray-500 ml-4">{s.current}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="bg-white border border-gray-200 rounded-3xl p-8 shadow-sm">
+                <h3 className="text-base font-black text-gray-800 mb-4">SLA 违约赔偿机制</h3>
+                <div className="overflow-hidden rounded-xl border border-gray-200">
+                  <table className="w-full text-sm">
+                    <thead className="bg-gray-50"><tr><th className="px-4 py-3 text-left font-bold text-gray-600">月可用性</th><th className="px-4 py-3 text-left font-bold text-gray-600">服务等级</th><th className="px-4 py-3 text-left font-bold text-gray-600">赔偿方案</th></tr></thead>
+                    <tbody>
+                      <tr className="border-t border-gray-100"><td className="px-4 py-3 text-green-600 font-bold">≥ 99.9%</td><td className="px-4 py-3">达标</td><td className="px-4 py-3 text-gray-500">—</td></tr>
+                      <tr className="border-t border-gray-100"><td className="px-4 py-3 text-amber-600 font-bold">99.0% ~ 99.9%</td><td className="px-4 py-3">轻微违约</td><td className="px-4 py-3 text-gray-500">延长 10% 服务期</td></tr>
+                      <tr className="border-t border-gray-100"><td className="px-4 py-3 text-red-600 font-bold">{'\u003C 99.0%'}</td><td className="px-4 py-3">严重违约</td><td className="px-4 py-3 text-gray-500">延长 30% 服务期 + 专项优化</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+                <p className="text-xs text-gray-400 mt-4">* SLA 协议在签署企业服务合同后正式生效。以上为标准条款，可根据客户需求定制。</p>
+              </div>
+            </div>
+          )}
+
+          {subTab === 'deploy' && (
+            <div className="max-w-4xl space-y-6">
+              <div className="bg-white border border-gray-200 rounded-3xl p-8 shadow-sm">
+                <h3 className="text-lg font-black text-gray-800 mb-2 flex items-center gap-2"><Cloud className="text-indigo-600" size={20}/> 私有化部署</h3>
+                <p className="text-sm text-gray-500 mb-6">将 ZDF.AI 完整部署到企业内网或指定云环境，数据不出域，满足合规与安全要求。</p>
+                <div className="grid grid-cols-2 gap-4 mb-6">
+                  {[
+                    { title: '容器化部署', desc: '提供 Docker / K8s Helm Chart，一键部署到企业容器平台', icon: '📦' },
+                    { title: '本地模型支持', desc: '对接企业自有大模型（如 LLaMA、ChatGLM 本地版），数据零外泄', icon: '🔒' },
+                    { title: '企业知识库', desc: '私有向量数据库，支持 Milvus / Weaviate / PgVector 对接', icon: '🗄️' },
+                    { title: 'LDAP/SSO 集成', desc: '对接企业 Active Directory、SAML 2.0、OAuth 2.0 单点登录', icon: '🔑' },
+                    { title: '审计合规', desc: '所有操作记录加密存储，满足 GDPR、等保三级等合规要求', icon: '📋' },
+                    { title: '高可用架构', desc: '多节点负载均衡 + 自动故障转移，支持跨 AZ 容灾部署', icon: '🏗️' },
+                  ].map((f, i) => (
+                    <div key={i} className="p-5 bg-gray-50 border border-gray-200 rounded-2xl">
+                      <div className="text-2xl mb-2">{f.icon}</div>
+                      <h4 className="font-bold text-sm text-gray-800 mb-1">{f.title}</h4>
+                      <p className="text-xs text-gray-500">{f.desc}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="bg-white border border-gray-200 rounded-3xl p-8 shadow-sm">
+                <h3 className="text-base font-black text-gray-800 mb-4">部署架构参考</h3>
+                <div className="bg-gray-50 rounded-2xl border border-gray-200 p-6 font-mono text-xs text-gray-600 leading-relaxed whitespace-pre">{`┌─────────────────────────────────────────────────┐
+│                 企业内网 / VPC                      │
+│                                                     │
+│   ┌──────────┐   ┌──────────┐   ┌──────────┐      │
+│   │  Nginx   │──▶│ ZDF.AI   │──▶│ 本地模型  │      │
+│   │  网关    │   │ Backend  │   │ LLaMA等  │      │
+│   └──────────┘   └────┬─────┘   └──────────┘      │
+│                       │                             │
+│          ┌────────────┴────────────┐                │
+│          ▼                         ▼                │
+│   ┌──────────┐            ┌──────────┐             │
+│   │  SQLite  │            │  Vector  │             │
+│   │ / PgSQL  │            │   DB     │             │
+│   └──────────┘            └──────────┘             │
+│                                                     │
+│   ┌──────────┐   ┌──────────┐   ┌──────────┐      │
+│   │  LDAP    │   │  审计日志 │   │  对象存储 │      │
+│   │  / SSO   │   │  加密归档 │   │  MinIO   │      │
+│   └──────────┘   └──────────┘   └──────────┘      │
+└─────────────────────────────────────────────────┘`}</div>
+              </div>
+              <div className="p-6 border-2 border-dashed border-indigo-200 rounded-2xl bg-indigo-50/50 text-center">
+                <Cloud className="mx-auto text-indigo-300 mb-3" size={40} />
+                <p className="text-sm font-bold text-indigo-600 mb-1">需要私有化部署？</p>
+                <p className="text-xs text-indigo-400">请联系我们的企业销售团队获取定制化部署方案与报价：enterprise@zdf.ai</p>
               </div>
             </div>
           )}
@@ -661,8 +1515,121 @@ const AdminApp = ({ auth, onLogout, dbUsers, setDbUsers, isTestMode, setIsTestMo
   );
 };
 
+// --- 密码修改组件 ---
+const PasswordChangeForm = () => {
+  const [oldPw, setOldPw] = useState('');
+  const [newPw, setNewPw] = useState('');
+  const [msg, setMsg] = useState('');
+  const [ok, setOk] = useState(false);
+  const handleSubmit = async () => {
+    setMsg('');
+    if (!oldPw || !newPw) return setMsg('请填写旧密码和新密码');
+    if (newPw.length < 6) return setMsg('新密码至少 6 位');
+    try {
+      const res = await fetch(`${API_BASE_URL}/auth/change-password`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${window.sessionStorage.getItem('token') || ''}` },
+        body: JSON.stringify({ oldPassword: oldPw, newPassword: newPw }),
+      });
+      const data = await res.json();
+      if (data.ok) { setOk(true); setMsg('密码修改成功'); setOldPw(''); setNewPw(''); }
+      else setMsg(data.error || '修改失败');
+    } catch { setMsg('网络错误，请检查后端是否运行'); }
+  };
+  return (
+    <div className="space-y-4 max-w-sm">
+      <input type="password" placeholder="当前密码" className="w-full px-4 py-2.5 text-sm border border-gray-200 rounded-xl outline-none focus:border-indigo-500" value={oldPw} onChange={e => setOldPw(e.target.value)} />
+      <input type="password" placeholder="新密码（至少 6 位）" className="w-full px-4 py-2.5 text-sm border border-gray-200 rounded-xl outline-none focus:border-indigo-500" value={newPw} onChange={e => setNewPw(e.target.value)} />
+      {msg && <p className={`text-xs font-bold ${ok ? 'text-green-600' : 'text-red-500'}`}>{msg}</p>}
+      <button onClick={handleSubmit} className="px-6 py-2.5 bg-indigo-600 text-white rounded-xl font-bold text-sm hover:bg-indigo-700 transition-colors">修改密码</button>
+    </div>
+  );
+};
+
+const ApiKeyManager = ({ plan }) => {
+  const [keys, setKeys] = useState([]);
+  const [allowed, setAllowed] = useState(false);
+  const [newKeyName, setNewKeyName] = useState('');
+  const [newKey, setNewKey] = useState('');
+  const [loading, setLoading] = useState(true);
+  const token = window.sessionStorage.getItem('token') || '';
+  const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` };
+
+  const fetchKeys = async () => {
+    try {
+      const res = await fetch(`${API_BASE_URL}/user/api-keys`, { headers });
+      const data = await res.json();
+      if (data.ok) { setKeys(data.keys || []); setAllowed(data.allowed !== false); }
+    } catch {}
+    setLoading(false);
+  };
+  useEffect(() => { fetchKeys(); }, []);
+
+  const createKey = async () => {
+    const res = await fetch(`${API_BASE_URL}/user/api-keys`, { method: 'POST', headers, body: JSON.stringify({ name: newKeyName }) });
+    const data = await res.json();
+    if (data.ok) { setNewKey(data.apiKey); setNewKeyName(''); fetchKeys(); }
+    else alert(data.error || '创建失败');
+  };
+
+  const deleteKey = async (keyPrefix) => {
+    if (!confirm('确定删除此 API Key？')) return;
+    await fetch(`${API_BASE_URL}/user/api-keys/${keyPrefix}`, { method: 'DELETE', headers });
+    fetchKeys();
+  };
+
+  if (loading) return null;
+  return (
+    <div className="bg-white border border-gray-200 rounded-3xl shadow-sm overflow-hidden">
+      <div className="p-6 border-b border-gray-100">
+        <h3 className="font-bold text-gray-800 flex items-center gap-2"><Key size={18} className="text-indigo-500"/> API Key 管理</h3>
+      </div>
+      <div className="p-6">
+        {!allowed ? (
+          <p className="text-sm text-gray-500">API 访问需要 Pro 或以上套餐。<span className="text-indigo-600 font-bold">请联系管理员升级。</span></p>
+        ) : (
+          <div className="space-y-4">
+            {newKey && (
+              <div className="p-4 bg-green-50 border border-green-200 rounded-xl">
+                <p className="text-xs font-bold text-green-700 mb-1">新 Key 已创建（仅显示一次，请妥善保存）:</p>
+                <code className="text-xs bg-green-100 px-2 py-1 rounded select-all break-all">{newKey}</code>
+                <button onClick={() => { navigator.clipboard?.writeText(newKey); }} className="ml-2 text-xs text-green-600 underline">复制</button>
+              </div>
+            )}
+            <div className="flex gap-2">
+              <input type="text" value={newKeyName} onChange={e => setNewKeyName(e.target.value)} placeholder="Key 名称（可选）" className="flex-1 px-4 py-2.5 text-sm border border-gray-200 rounded-xl outline-none focus:border-indigo-500" />
+              <button onClick={createKey} className="px-5 py-2.5 bg-indigo-600 text-white rounded-xl font-bold text-sm hover:bg-indigo-700 flex items-center gap-1"><Plus size={14} /> 创建 Key</button>
+            </div>
+            {keys.length > 0 ? (
+              <div className="space-y-2">
+                {keys.map(k => (
+                  <div key={k.key} className="flex items-center justify-between p-3 bg-gray-50 rounded-xl text-sm">
+                    <div>
+                      <span className="font-bold text-gray-700">{k.name}</span>
+                      <code className="ml-2 text-xs text-gray-500 bg-gray-200 px-1.5 py-0.5 rounded">{k.key}</code>
+                      <span className="ml-2 text-[10px] text-gray-400">{k.lastUsed ? `最后使用: ${new Date(k.lastUsed).toLocaleDateString()}` : '未使用'}</span>
+                    </div>
+                    <button onClick={() => deleteKey(k.key.split('...')[0])} className="text-red-400 hover:text-red-600"><Trash2 size={14} /></button>
+                  </div>
+                ))}
+              </div>
+            ) : <p className="text-xs text-gray-400">暂无 API Key，点击"创建 Key"生成</p>}
+            <div className="mt-4 p-4 bg-gray-50 rounded-xl">
+              <p className="text-xs font-bold text-gray-600 mb-2">API 使用示例:</p>
+              <code className="text-[11px] text-gray-500 block whitespace-pre">{`curl -X POST ${window.location.origin}/api/ai/generate \\
+  -H "Authorization: Bearer zdf_ak_your_key" \\
+  -H "Content-Type: application/json" \\
+  -d '{"prompt":"你的问题","dispatch":{"vendor":"deepseek","model":"deepseek-chat"}}'`}</code>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
 // --- 模块 3：前端用户工作台 ---
-const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, dbUsers }) => {
+const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, onUpdateAuth, dbUsers, vendors, strategy }) => {
   const [activeTab, setActiveTab] = useState('dispatch'); 
   const [showAdminAuth, setShowAdminAuth] = useState(false);
   const [adminUsername, setAdminUsername] = useState('');
@@ -670,19 +1637,19 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, dbUsers 
   const [adminAuthError, setAdminAuthError] = useState('');
 
   const [configs, setConfigs] = useState({
-    A: { vendor: 'deepseek', model: 'deepseek-chat (V3)', mode: 'platform', key: '' },
+    A: { vendor: 'deepseek', model: 'deepseek-v4-pro', mode: 'platform', key: '' },
     B: { vendor: 'alibaba', model: 'qwen-max', mode: 'platform', key: '' },
-    C: { vendor: 'anthropic', model: 'claude-3.5-sonnet', mode: 'platform', key: '' },
-    D: { vendor: 'openai', model: 'gpt-4o', mode: 'platform', key: '' },
+    C: { vendor: 'anthropic', model: 'claude-sonnet-4-6', mode: 'platform', key: '' },
+    D: { vendor: 'openai', model: 'gpt-4.1', mode: 'platform', key: '' },
   });
   const [question, setQuestion] = useState("");
   const [attachments, setAttachments] = useState([]);
   const fileInputRef = useRef(null);
-  const [strategy, setStrategy] = useState("fusion");
   const [isRunning, setIsRunning] = useState(false);
   const [currentStep, setCurrentStep] = useState(null);
   const [results, setResults] = useState({ A: "", B: "", C: "", D: "", final: "" });
-  const [scores, setScores] = useState({ B: 0, C: 0, D: 0 });
+  const [showComplete, setShowComplete] = useState(false);
+  const [scores, setScores] = useState({ A: 0, B: 0, C: 0, D: 0 });
   const [history, setHistory] = useState([]);
   const [resultTab, setResultTab] = useState('final');
   const [selectedHistoryId, setSelectedHistoryId] = useState(null);
@@ -691,6 +1658,47 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, dbUsers 
   const creditKey = `zdf_credits_${auth.id}_${new Date().toDateString()}`;
   const [dailyTasksUsed, setDailyTasksUsed] = useState(() => parseInt(sessionStorage.getItem(todayKey) || '0', 10));
   const [creditsUsed, setCreditsUsed] = useState(() => parseInt(sessionStorage.getItem(creditKey) || '0', 10));
+  const [showTemplates, setShowTemplates] = useState(false);
+  const [templates, setTemplates] = useState([]);
+  const [tplCategory, setTplCategory] = useState('all');
+  const [useRag, setUseRag] = useState(false);
+  const [ragDocs, setRagDocs] = useState([]);
+  const [ragStorage, setRagStorage] = useState({ usedBytes: 0, quotaMB: -1 });
+  const [ragUploading, setRagUploading] = useState(false);
+  const ragFileRef = useRef(null);
+  const [userUsageData, setUserUsageData] = useState(null);
+  const [editName, setEditName] = useState('');
+  const [editingName, setEditingName] = useState(false);
+
+  const fetchRagDocs = () => {
+    fetch(`${API_BASE_URL}/rag/docs`, { headers: { Authorization: `Bearer ${window.sessionStorage.getItem('token') || ''}` } })
+      .then(r => r.ok ? r.json() : null)
+      .then(d => { if (d?.docs) { setRagDocs(d.docs); if (d.storage) setRagStorage(d.storage); } })
+      .catch(() => {});
+  };
+
+  useEffect(() => {
+    fetch(`${API_BASE_URL}/prompt-templates`, { headers: { Authorization: `Bearer ${window.sessionStorage.getItem('token') || ''}` } })
+      .then(r => r.ok ? r.json() : null)
+      .then(d => { if (d?.templates) setTemplates(d.templates); })
+      .catch(() => {});
+    fetchRagDocs();
+    // 获取用户使用数据 (趋势图 + 同步今日计数器)
+    fetch(`${API_BASE_URL}/user/usage`, { headers: { Authorization: `Bearer ${window.sessionStorage.getItem('token') || ''}` } })
+      .then(r => r.ok ? r.json() : null)
+      .then(d => {
+        if (d) {
+          setUserUsageData(d);
+          if (d.today) {
+            setDailyTasksUsed(d.today.tasks || 0);
+            setCreditsUsed(d.today.credits || 0);
+            sessionStorage.setItem(todayKey, String(d.today.tasks || 0));
+            sessionStorage.setItem(creditKey, String(d.today.credits || 0));
+          }
+        }
+      })
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     fetch(`${API_BASE_URL}/user/history`, { headers: { 'Authorization': `Bearer ${window.sessionStorage.getItem('token')}` } })
@@ -699,8 +1707,15 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, dbUsers 
       .catch(() => console.warn("无法连接到后端加载历史记录"));
   }, []);
 
+  useEffect(() => {
+    if (showComplete) {
+      const timer = setTimeout(() => setShowComplete(false), 4000);
+      return () => clearTimeout(timer);
+    }
+  }, [showComplete]);
+
   const RoleConfigUser = ({ role, config, onUpdate }) => {
-    const currentVendor = VENDORS.find(v => v.id === config.vendor) || VENDORS[0];
+    const currentVendor = vendors.find(v => v.id === config.vendor) || vendors[0];
     return (
       <div className="p-4 border-b border-gray-100 last:border-0 hover:bg-gray-50">
         <div className="flex items-center gap-2 mb-3">
@@ -709,9 +1724,9 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, dbUsers 
         </div>
         <div className="space-y-2">
           <div className="flex gap-2">
-            <select className="w-1/2 text-xs p-2 border rounded bg-white" value={config.vendor} onChange={(e) => { const vendor = VENDORS.find(v => v.id === e.target.value); onUpdate(role.id, { vendor: e.target.value, model: vendor.models[0] }); }}>
-              <optgroup label="海外厂商">{VENDORS.filter(v => v.region === 'US').map(v => <option key={v.id} value={v.id}>{v.name}</option>)}</optgroup>
-              <optgroup label="国内厂商">{VENDORS.filter(v => v.region === 'CN').map(v => <option key={v.id} value={v.id}>{v.name}</option>)}</optgroup>
+            <select className="w-1/2 text-xs p-2 border rounded bg-white" value={config.vendor} onChange={(e) => { const vendor = vendors.find(v => v.id === e.target.value); onUpdate(role.id, { vendor: e.target.value, model: vendor.models[0] }); }}>
+              <optgroup label="海外厂商">{vendors.filter(v => v.region === 'US').map(v => <option key={v.id} value={v.id}>{v.name}</option>)}</optgroup>
+              <optgroup label="国内厂商">{vendors.filter(v => v.region === 'CN').map(v => <option key={v.id} value={v.id}>{v.name}</option>)}</optgroup>
             </select>
             <select className="w-1/2 text-[11px] p-2 border rounded bg-white" value={config.model} onChange={(e) => onUpdate(role.id, { model: e.target.value })}>{currentVendor.models.map(m => <option key={m} value={m}>{m}</option>)}</select>
           </div>
@@ -725,28 +1740,51 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, dbUsers 
     );
   };
 
-  const handleDownload = (format) => {
+  /** 计算各步骤质量分 (0-100) */
+  const calcScores = (r) => {
+    const lenScore = (t) => Math.min(100, Math.max(20, Math.round(Math.log(Math.max(1, t.length)) * 10)));
+    const overlap = (a, b) => {
+      if (!a || !b) return 0;
+      const wa = new Set(a.replace(/[^\w\u4e00-\u9fff]/g, ' ').split(/\s+/).filter(Boolean));
+      const wb = new Set(b.replace(/[^\w\u4e00-\u9fff]/g, ' ').split(/\s+/).filter(Boolean));
+      let shared = 0; wa.forEach(w => { if (wb.has(w)) shared++; });
+      return wa.size > 0 ? shared / wa.size : 0;
+    };
+    const sa = lenScore(r.A || '');
+    const sb = r.B ? Math.min(100, Math.round(lenScore(r.B) * 0.6 + overlap(r.A, r.B) * 40)) : 0;
+    const sc = r.C ? Math.min(100, Math.round(lenScore(r.C) * 0.5 + (1 - overlap(r.B, r.C)) * 30 + 20)) : 0;
+    const sd = r.D ? Math.min(100, Math.round(lenScore(r.D) * 0.4 + overlap(r.A, r.D) * 30 + 30)) : 0;
+    return { A: sa, B: sb, C: sc, D: sd };
+  };
+
+  const handleDownload = async (format) => {
     if (!results.final) return;
     const limits = PLAN_LIMITS[auth.plan] || PLAN_LIMITS.free;
     if (!limits.canExport) {
       alert('导出功能需要 Pro 版或以上套餐，请联系管理员升级');
       return;
     }
+    const token = window.sessionStorage.getItem('token') || '';
+    // 服务端导出（PDF / DOCX）
+    if (format === 'pdf' || format === 'doc') {
+      const endpoint = format === 'pdf' ? 'user/export-pdf' : 'user/export-docx';
+      const ext = format === 'pdf' ? 'pdf' : 'docx';
+      try {
+        const r = await fetch(`${API_BASE_URL}/${endpoint}`, { headers: { Authorization: `Bearer ${token}` } });
+        if (!r.ok) { const d = await r.json().catch(() => ({})); alert(d.error || '导出失败'); return; }
+        const blob = await r.blob();
+        const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `ZDF_${Date.now()}.${ext}`; a.click(); URL.revokeObjectURL(a.href);
+      } catch { alert('导出失败，请检查网络'); }
+      return;
+    }
     const text = results.final;
     const ts = new Date().toLocaleString();
     const esc = (s) => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
     const htmlTpl = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>ZDF.AI 输出</title><style>body{font-family:system-ui,sans-serif;max-width:800px;margin:40px auto;padding:0 24px;line-height:1.8;color:#222}h1{font-size:20px}p.ts{color:#888;font-size:13px}pre{white-space:pre-wrap;word-break:break-word}@media print{body{margin:0}}</style></head><body><h1>ZDF.AI 输出</h1><p class="ts">${ts}</p><hr><pre>${esc(text)}</pre></body></html>`;
-    if (format === 'pdf') {
-      const win = window.open('', '_blank');
-      win.document.write(htmlTpl + '<script>window.onload=function(){window.print();}<\/script>');
-      win.document.close();
-      return;
-    }
     const configs = {
-      doc:  { content: text,    mime: 'application/msword', ext: 'doc' },
-      txt:  { content: text,    mime: 'text/plain',         ext: 'txt' },
-      md:   { content: text,    mime: 'text/markdown',      ext: 'md'  },
-      html: { content: htmlTpl, mime: 'text/html',          ext: 'html'},
+      txt:  { content: text,     mime: 'text/plain',         ext: 'txt' },
+      md:   { content: text,     mime: 'text/markdown',      ext: 'md'  },
+      html: { content: htmlTpl,  mime: 'text/html',          ext: 'html'},
     };
     const cfg = configs[format];
     if (!cfg) return;
@@ -799,12 +1837,14 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, dbUsers 
       return;
     }
     setIsRunning(true);
+    setShowComplete(false);
     setResultTab('final');
     const newResults = { A: '', B: '', C: '', D: '', final: '' };
 
     try {
       setCurrentStep('A');
-      newResults.A = await callGemini(question, '直接回答用户问题。', attachments, buildDispatch('A'));
+      const ragExtra = useRag ? { useRag: true, creditCost: CREDIT_COSTS.rag } : { creditCost: 0 };
+      newResults.A = await callGemini(question, '直接回答用户问题。', attachments, buildDispatch('A'), ragExtra);
       setResults({ ...newResults });
 
       setCurrentStep('B');
@@ -813,6 +1853,7 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, dbUsers 
         '你是一个严格的事实校核员。',
         attachments,
         buildDispatch('B'),
+        { creditCost: 0 },
       );
       setResults({ ...newResults });
 
@@ -822,18 +1863,22 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, dbUsers 
         '你是一个专业的审核专家。',
         attachments,
         buildDispatch('C'),
+        { creditCost: 0 },
       );
       setResults({ ...newResults });
 
       setCurrentStep('D');
       const resD = await callGemini(
-        `审核结果:\n${newResults.C}\n任务: 严格按照策略输出纯文本。`,
-        '负责最终纯文本排版。',
+        `原始问题: ${question}\n\n阶段A（生成者）输出:\n${newResults.A}\n\n阶段B（校核者）输出:\n${newResults.B}\n\n阶段C（审核者）输出:\n${newResults.C}\n\n任务: 作为终审者，根据策略输出最终纯文本结果。`,
+        '',
         attachments,
         buildDispatch('D'),
+        { strategy, creditCost: CREDIT_COSTS.pipeline },
       );
       newResults.D = stripMarkdown(resD);
       newResults.final = newResults.D;
+      setShowComplete(true);
+      setScores(calcScores(newResults));
 
       setResults({ ...newResults });
       const histEntry = {
@@ -844,12 +1889,19 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, dbUsers 
         strategyName: STRATEGIES.find((s) => s.id === strategy).name,
       };
       setHistory((prev) => [histEntry, ...prev]);
-      const newTasks = dailyTasksUsed + 1;
-      const newCredits = creditsUsed + PIPELINE_CREDITS;
-      setDailyTasksUsed(newTasks);
-      setCreditsUsed(newCredits);
-      sessionStorage.setItem(todayKey, String(newTasks));
-      sessionStorage.setItem(creditKey, String(newCredits));
+      // 从后端重新获取准确的使用量计数
+      try {
+        const usageRes = await fetch(`${API_BASE_URL}/user/usage`, { headers: { Authorization: `Bearer ${window.sessionStorage.getItem('token') || ''}` } });
+        if (usageRes.ok) {
+          const ud = await usageRes.json();
+          if (ud.today) {
+            setDailyTasksUsed(ud.today.tasks || 0);
+            setCreditsUsed(ud.today.credits || 0);
+            sessionStorage.setItem(todayKey, String(ud.today.tasks || 0));
+            sessionStorage.setItem(creditKey, String(ud.today.credits || 0));
+          }
+        }
+      } catch { /* 回退: 保持当前本地值 */ }
       fetch(`${API_BASE_URL}/user/history`, {
         method: 'POST',
         headers: {
@@ -866,18 +1918,25 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, dbUsers 
     }
   };
 
-  const handleAdminAuth = () => {
+  const handleAdminAuth = async () => {
     setAdminAuthError('');
     if (!adminUsername || !adminPassword) {
       setAdminAuthError('请输入管理员账号和密码');
       return;
     }
-    const adminUser = dbUsers.find(u => u.username === adminUsername && u.password === adminPassword && u.role === 'admin');
-    if (adminUser) {
+    try {
+      const r = await fetch(`${API_BASE_URL}/auth/login`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: adminUsername, password: adminPassword }),
+      });
+      const data = await r.json();
+      if (!r.ok) { setAdminAuthError(data.error || '认证失败'); return; }
+      if (data.user?.role !== 'admin') { setAdminAuthError('该账号不是管理员'); return; }
+      window.sessionStorage.setItem('token', data.token);
       setShowAdminAuth(false);
-      onSwitchToAdmin(adminUser); 
-    } else {
-      setAdminAuthError('非管理员账号或密码错误！');
+      onSwitchToAdmin(data.user);
+    } catch {
+      setAdminAuthError('无法连接后端服务，请检查网络');
     }
   };
 
@@ -920,7 +1979,8 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, dbUsers 
           <button onClick={() => setActiveTab('dispatch')} className={`w-full py-3 flex justify-center rounded-xl transition-all ${activeTab === 'dispatch' ? 'bg-indigo-700 text-white' : 'hover:bg-indigo-800'}`} title="调度中心"><Activity size={22} /></button>
           <button onClick={() => setActiveTab('history')} className={`w-full py-3 flex justify-center rounded-xl transition-all ${activeTab === 'history' ? 'bg-indigo-700 text-white' : 'hover:bg-indigo-800'}`} title="历史记录"><Clock size={22} /></button>
           <button onClick={() => setActiveTab('profile')} className={`w-full py-3 flex justify-center rounded-xl transition-all ${activeTab === 'profile' ? 'bg-indigo-700 text-white' : 'hover:bg-indigo-800'}`} title="账户设置"><Settings size={22} /></button>
-          
+          <button onClick={() => setActiveTab('rag')} className={`w-full py-3 flex justify-center rounded-xl transition-all ${activeTab === 'rag' ? 'bg-indigo-700 text-white' : 'hover:bg-indigo-800'}`} title="知识库"><Database size={22} /></button>
+
           <div className="w-8 h-[1px] bg-indigo-800 mx-auto my-2"></div>
           
           <button 
@@ -942,8 +2002,8 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, dbUsers 
               {ROLES.map(role => <RoleConfigUser key={role.id} role={role} config={configs[role.id]} onUpdate={(id, part) => setConfigs(p => ({ ...p, [id]: { ...p[id], ...part } }))} />)}
             </div>
             <div className="p-4 bg-gray-50 border-t border-gray-100">
-              <label className="text-xs font-bold text-gray-700 block mb-2">终审策略</label>
-              <select className="w-full p-2 text-sm border rounded outline-none" value={strategy} onChange={e=>setStrategy(e.target.value)}>{STRATEGIES.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}</select>
+              <label className="text-xs font-bold text-gray-400 block mb-1">终审策略</label>
+              <div className="text-sm font-bold text-indigo-600">{(STRATEGIES.find(s => s.id === strategy) || STRATEGIES[0]).name}</div>
             </div>
           </aside>
 
@@ -965,7 +2025,8 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, dbUsers 
                       <button onClick={()=>setResultTab('steps')} className={`px-6 py-4 text-sm font-bold ${resultTab==='steps'?'border-b-2 border-indigo-600 text-indigo-600':'text-gray-500'}`}>推理过程</button>
                     </div>
                     <div className="p-8">
-                      {isRunning && !results.final && <div className="text-center text-gray-400 py-10">模型流转中...</div>}
+                      {isRunning && !results.final && <PipelineAnimation currentStep={currentStep} configs={configs} results={results} vendors={vendors} isComplete={false} />}
+                      {showComplete && results.final && resultTab==='final' && <PipelineAnimation currentStep={null} configs={configs} results={results} vendors={vendors} isComplete={true} />}
                       {results.final && resultTab==='final' && (
                         <div className="text-gray-800 leading-relaxed whitespace-pre-wrap">{results.final}
                           <div className="mt-8 pt-4 border-t border-gray-100 flex flex-wrap gap-2">
@@ -980,7 +2041,22 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, dbUsers 
                       )}
                       {results.final && resultTab==='steps' && (
                         <div className="space-y-4">
-                          {ROLES.map(r => <div key={r.id} className="p-4 bg-gray-50 rounded-lg text-sm text-gray-700 whitespace-pre-wrap"><strong>{r.id}:</strong><br/>{results[r.id]}</div>)}
+                          {ROLES.map(r => (
+                            <div key={r.id} className="p-4 bg-gray-50 rounded-lg text-sm text-gray-700">
+                              <div className="flex items-center justify-between mb-2">
+                                <strong className="text-gray-800">{r.id} · {r.name}</strong>
+                                {scores[r.id] > 0 && (
+                                  <div className="flex items-center gap-2">
+                                    <div className="w-20 h-2 bg-gray-200 rounded-full overflow-hidden">
+                                      <div className={`h-full rounded-full transition-all ${scores[r.id] >= 80 ? 'bg-green-500' : scores[r.id] >= 50 ? 'bg-amber-500' : 'bg-red-400'}`} style={{width: `${scores[r.id]}%`}} />
+                                    </div>
+                                    <span className={`text-xs font-bold ${scores[r.id] >= 80 ? 'text-green-600' : scores[r.id] >= 50 ? 'text-amber-600' : 'text-red-500'}`}>{scores[r.id]}分</span>
+                                  </div>
+                                )}
+                              </div>
+                              <div className="whitespace-pre-wrap">{results[r.id]}</div>
+                            </div>
+                          ))}
                         </div>
                       )}
                     </div>
@@ -1006,10 +2082,35 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, dbUsers 
                 <div className="flex justify-between items-center bg-gray-50 p-2 pl-4 border-t border-gray-100">
                   <div className="flex items-center gap-1">
                     <input type="file" ref={fileInputRef} onChange={handleFileChange} className="hidden" accept="image/*,.pdf,.doc,.docx,.xls,.xlsx,.txt,.csv,.md" multiple/>
-                    <button onClick={()=>fileInputRef.current?.click()} className="p-2 text-gray-500 hover:text-indigo-600" title="上传文件（图片、文档、PDF等）"><Paperclip size={18}/></button>
+                    <button onClick={()=>fileInputRef.current?.click()} className="p-2 text-gray-500 hover:text-indigo-600" title="上传文件"><Paperclip size={18}/></button>
+                    <button onClick={()=>setShowTemplates(!showTemplates)} className={`p-2 ${showTemplates ? 'text-indigo-600' : 'text-gray-500'} hover:text-indigo-600`} title="Prompt 模板库"><BookOpen size={18}/></button>
+                    {(PLAN_LIMITS[auth.plan] || {}).canRag && ragDocs.length > 0 && (
+                      <button onClick={()=>setUseRag(!useRag)} className={`px-2 py-1 rounded-lg text-xs font-bold flex items-center gap-1 transition-colors ${useRag ? 'bg-indigo-100 text-indigo-700 ring-1 ring-indigo-300' : 'text-gray-400 hover:text-indigo-500'}`} title="启用知识库增强">
+                        <Database size={14}/> RAG {useRag ? 'ON' : 'OFF'}
+                      </button>
+                    )}
                   </div>
                   <button onClick={runPipeline} disabled={isRunning} className="px-5 py-2 bg-indigo-600 text-white rounded-xl font-bold flex items-center gap-2 disabled:opacity-50"><Send size={14}/> 发送</button>
                 </div>
+                {showTemplates && (
+                  <div className="border-t border-gray-100 bg-gray-50 p-4 max-h-64 overflow-y-auto">
+                    <div className="flex items-center gap-2 mb-3 flex-wrap">
+                      <span className="text-xs font-bold text-gray-500">模板分类:</span>
+                      {['all', ...new Set(templates.map(t => t.category))].map(cat => (
+                        <button key={cat} onClick={() => setTplCategory(cat)} className={`px-2 py-0.5 text-xs rounded-full ${tplCategory === cat ? 'bg-indigo-600 text-white' : 'bg-white text-gray-600 border border-gray-200'}`}>{cat === 'all' ? '全部' : cat}</button>
+                      ))}
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      {templates.filter(t => tplCategory === 'all' || t.category === tplCategory).map(tpl => (
+                        <button key={tpl.id} onClick={() => { setQuestion(tpl.prompt.replace('{input}', '')); setShowTemplates(false); }} className="text-left p-3 bg-white rounded-xl border border-gray-200 hover:border-indigo-300 hover:shadow-sm transition-all">
+                          <div className="font-bold text-sm text-gray-800">{tpl.title}</div>
+                          <div className="text-xs text-gray-500 mt-0.5">{tpl.desc}</div>
+                          <span className={`mt-1 inline-block text-[10px] px-1.5 py-0.5 rounded-full ${tpl.plan === 'free' ? 'bg-gray-100 text-gray-600' : tpl.plan === 'pro' ? 'bg-indigo-100 text-indigo-600' : 'bg-purple-100 text-purple-600'}`}>{tpl.plan}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
           </main>
@@ -1153,6 +2254,149 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, dbUsers 
                 )}
               </div>
 
+              {/* 用量预警 */}
+              {limits.dailyTasks > 0 && taskPct >= 80 && (
+                <div className={`p-4 rounded-2xl border-2 flex items-center gap-3 ${taskPct >= 100 ? 'bg-red-50 border-red-300' : 'bg-amber-50 border-amber-300'}`}>
+                  <AlertTriangle size={20} className={taskPct >= 100 ? 'text-red-500' : 'text-amber-500'} />
+                  <div>
+                    <p className={`text-sm font-bold ${taskPct >= 100 ? 'text-red-700' : 'text-amber-700'}`}>
+                      {taskPct >= 100 ? '今日任务已达上限！' : `今日任务已使用 ${taskPct}%，即将达到上限`}
+                    </p>
+                    <p className="text-xs text-gray-500 mt-0.5">
+                      {taskPct >= 100 ? '请升级到 Pro 版获取更多任务额度，或等待明日重置。' : `已使用 ${dailyTasksUsed}/${limits.dailyTasks} 次，建议合理规划剩余用量。`}
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {/* 个人资料编辑 */}
+              <div className="bg-white border border-gray-200 rounded-3xl shadow-sm overflow-hidden">
+                <div className="p-6 border-b border-gray-100">
+                  <h3 className="font-bold text-gray-800 flex items-center gap-2"><UserCog size={18} className="text-indigo-500"/> 个人资料</h3>
+                </div>
+                <div className="p-6 space-y-4">
+                  <div className="flex items-center gap-4">
+                    <span className="text-sm text-gray-500 w-20">用户名</span>
+                    <span className="text-sm font-bold text-gray-700">{auth.username}</span>
+                  </div>
+                  <div className="flex items-center gap-4">
+                    <span className="text-sm text-gray-500 w-20">显示昵称</span>
+                    {editingName ? (
+                      <div className="flex items-center gap-2 flex-1">
+                        <input value={editName} onChange={e => setEditName(e.target.value)} maxLength={50}
+                          className="flex-1 px-3 py-1.5 border rounded-xl text-sm focus:ring-2 focus:ring-indigo-300 outline-none" autoFocus />
+                        <button onClick={async () => {
+                          if (!editName.trim()) return;
+                          try {
+                            const r = await fetch(`${API_BASE_URL}/user/profile`, {
+                              method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${window.sessionStorage.getItem('token') || ''}` },
+                              body: JSON.stringify({ name: editName.trim() }),
+                            });
+                            if (r.ok) { onUpdateAuth({ ...auth, name: editName.trim() }); setEditingName(false); }
+                          } catch {}
+                        }} className="px-3 py-1.5 bg-indigo-600 text-white text-xs font-bold rounded-xl hover:bg-indigo-700">
+                          <Save size={14}/>
+                        </button>
+                        <button onClick={() => setEditingName(false)} className="px-3 py-1.5 bg-gray-200 text-gray-600 text-xs font-bold rounded-xl hover:bg-gray-300">取消</button>
+                      </div>
+                    ) : (
+                      <div className="flex items-center gap-2">
+                        <span className="text-sm font-bold text-gray-700">{auth.name}</span>
+                        <button onClick={() => { setEditName(auth.name || ''); setEditingName(true); }}
+                          className="px-2 py-1 text-xs text-indigo-600 hover:bg-indigo-50 rounded-lg">编辑</button>
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-4">
+                    <span className="text-sm text-gray-500 w-20">套餐</span>
+                    <span className="text-sm font-bold text-gray-700">{currentPlan.name}</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* 7日使用趋势 */}
+              {userUsageData?.allDays && (
+                <div className="bg-white border border-gray-200 rounded-3xl shadow-sm overflow-hidden">
+                  <div className="p-6 border-b border-gray-100">
+                    <h3 className="font-bold text-gray-800 flex items-center gap-2"><Activity size={18} className="text-indigo-500"/> 最近 7 天使用趋势</h3>
+                  </div>
+                  <div className="p-6">
+                    <div className="flex items-end gap-2 h-28">
+                      {(() => {
+                        const days = [];
+                        for (let i = 6; i >= 0; i--) {
+                          const d = new Date(); d.setDate(d.getDate() - i);
+                          const dk = d.toISOString().slice(0, 10);
+                          const dd = userUsageData.allDays[dk] || { tasks: 0, credits: 0, tokens: { input: 0, output: 0 } };
+                          days.push({ date: dk, ...dd });
+                        }
+                        const maxT = Math.max(1, ...days.map(x => x.tasks));
+                        return days.map(d => {
+                          const pct = Math.max(4, (d.tasks / maxT) * 100);
+                          return (
+                            <div key={d.date} className="flex-1 flex flex-col items-center gap-1">
+                              <span className="text-[10px] font-bold text-gray-600">{d.tasks}</span>
+                              <div className="w-full bg-indigo-100 rounded-t-lg relative" style={{height: `${pct}%`}}>
+                                <div className="absolute inset-0 bg-indigo-500 rounded-t-lg opacity-80"/>
+                              </div>
+                              <span className="text-[10px] text-gray-400">{d.date.slice(5)}</span>
+                              <span className="text-[9px] text-gray-400">{((d.tokens?.input || 0) + (d.tokens?.output || 0)).toLocaleString()} tok</span>
+                            </div>
+                          );
+                        });
+                      })()}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* 历史记录导出 */}
+              {history.length > 0 && (
+                <div className="bg-white border border-gray-200 rounded-3xl shadow-sm overflow-hidden">
+                  <div className="p-6 border-b border-gray-100">
+                    <h3 className="font-bold text-gray-800 flex items-center gap-2"><Download size={18} className="text-indigo-500"/> 历史记录导出</h3>
+                  </div>
+                  <div className="p-6 flex items-center gap-4">
+                    <p className="text-sm text-gray-500 flex-1">共 {history.length} 条对话记录，可导出为 CSV 或 JSON 格式</p>
+                    <button onClick={async () => {
+                      try {
+                        const r = await fetch(`${API_BASE_URL}/user/export-history?format=csv`, { headers: { Authorization: `Bearer ${window.sessionStorage.getItem('token') || ''}` } });
+                        if (!r.ok) { const d = await r.json().catch(()=>({})); alert(d.error || '导出失败'); return; }
+                        const blob = await r.blob();
+                        const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'zdf_history.csv'; a.click(); URL.revokeObjectURL(a.href);
+                      } catch { alert('导出失败，请检查网络'); }
+                    }} className="px-4 py-2 bg-emerald-600 text-white text-sm font-bold rounded-xl hover:bg-emerald-700 flex items-center gap-1.5"><Download size={14}/> CSV</button>
+                    <button onClick={async () => {
+                      try {
+                        const r = await fetch(`${API_BASE_URL}/user/export-history?format=json`, { headers: { Authorization: `Bearer ${window.sessionStorage.getItem('token') || ''}` } });
+                        if (!r.ok) { const d = await r.json().catch(()=>({})); alert(d.error || '导出失败'); return; }
+                        const blob = await r.blob();
+                        const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'zdf_history.json'; a.click(); URL.revokeObjectURL(a.href);
+                      } catch { alert('导出失败，请检查网络'); }
+                    }} className="px-4 py-2 bg-indigo-600 text-white text-sm font-bold rounded-xl hover:bg-indigo-700 flex items-center gap-1.5"><Download size={14}/> JSON</button>
+                  </div>
+                </div>
+              )}
+
+              {/* 套餐升级 */}
+              {auth.plan === 'free' && (
+                <div className="bg-gradient-to-r from-amber-50 to-orange-50 border-2 border-amber-200 rounded-3xl p-6">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <h3 className="font-black text-gray-800 flex items-center gap-2"><Crown size={20} className="text-amber-500"/> 升级到 Pro 版</h3>
+                      <p className="text-sm text-gray-500 mt-1">解锁 500 次/日任务、RAG 知识库、API 接口、导出功能等专业能力</p>
+                      <div className="flex gap-2 mt-3">
+                        <span className="text-xs px-2 py-1 bg-amber-100 text-amber-700 rounded-full font-bold">199~399 RMB/月</span>
+                        <span className="text-xs px-2 py-1 bg-amber-100 text-amber-700 rounded-full font-bold">€29~59/月</span>
+                      </div>
+                    </div>
+                    <button onClick={() => alert('支付系统正在对接中，请联系管理员手动升级：enterprise@zdf.ai')} className="px-6 py-3 bg-gradient-to-r from-amber-500 to-orange-500 text-white font-bold rounded-2xl shadow-lg hover:shadow-xl transition-all flex items-center gap-2">
+                      <ArrowRight size={16}/> 立即升级
+                    </button>
+                  </div>
+                </div>
+              )}
+
               {/* 套餐对比表 */}
               <div className="bg-white border border-gray-200 rounded-3xl shadow-sm overflow-hidden">
                 <div className="p-6 border-b border-gray-100">
@@ -1196,6 +2440,119 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, dbUsers 
                   <p className="text-xs text-gray-400">套餐升级请联系管理员 · Enterprise 版支持私有化部署与定制 SLA</p>
                 </div>
               </div>
+
+              {/* 修改密码 */}
+              <div className="bg-white border border-gray-200 rounded-3xl shadow-sm overflow-hidden">
+                <div className="p-6 border-b border-gray-100">
+                  <h3 className="font-bold text-gray-800 flex items-center gap-2"><Lock size={18} className="text-indigo-500"/> 修改密码</h3>
+                </div>
+                <div className="p-6">
+                  <PasswordChangeForm />
+                </div>
+              </div>
+
+              {/* API Key 管理 */}
+              <ApiKeyManager plan={auth.plan} />
+            </div>
+          </div>
+        );
+      })()}
+
+      {activeTab === 'rag' && (() => {
+        const limits = PLAN_LIMITS[auth.plan] || PLAN_LIMITS.free;
+        if (!limits.canRag) {
+          return (
+            <div className="flex-1 flex items-center justify-center">
+              <div className="text-center p-8">
+                <Database size={48} className="mx-auto text-gray-300 mb-4" />
+                <h3 className="text-lg font-bold text-gray-700 mb-2">知识库功能需要 Pro 版或以上套餐</h3>
+                <p className="text-sm text-gray-400">升级后可上传文档，让 AI 基于您的专属知识库回答问题</p>
+              </div>
+            </div>
+          );
+        }
+
+        const handleRagUpload = async (e) => {
+          const file = e.target.files?.[0];
+          if (!file) return;
+          setRagUploading(true);
+          try {
+            const formData = new FormData();
+            formData.append('file', file);
+            const res = await fetch(`${API_BASE_URL}/rag/upload`, {
+              method: 'POST',
+              headers: { Authorization: `Bearer ${window.sessionStorage.getItem('token') || ''}` },
+              body: formData,
+            });
+            const data = await res.json();
+            if (data.ok) {
+              fetchRagDocs();
+            } else {
+              alert(data.error || '上传失败');
+            }
+          } catch {
+            alert('上传失败，请检查网络连接');
+          }
+          setRagUploading(false);
+          if (ragFileRef.current) ragFileRef.current.value = '';
+        };
+
+        const handleRagDelete = async (docId) => {
+          if (!confirm('确定删除该文档？向量索引将一并清除。')) return;
+          try {
+            const res = await fetch(`${API_BASE_URL}/rag/docs/${docId}`, {
+              method: 'DELETE',
+              headers: { Authorization: `Bearer ${window.sessionStorage.getItem('token') || ''}` },
+            });
+            if (res.ok) fetchRagDocs();
+          } catch {}
+        };
+
+        return (
+          <div className="flex-1 p-8 overflow-y-auto">
+            <div className="max-w-4xl mx-auto space-y-6">
+              <div className="flex items-center justify-between">
+                <h2 className="text-2xl font-black text-gray-800 flex items-center gap-2"><Database size={24} className="text-indigo-500"/> 知识库管理</h2>
+                <div className="flex items-center gap-3">
+                  <span className="text-xs text-gray-400">{ragDocs.length} 篇文档 · {(ragStorage.usedBytes / 1024 / 1024).toFixed(1)}MB{ragStorage.quotaMB > 0 ? ` / ${ragStorage.quotaMB >= 1024 ? (ragStorage.quotaMB / 1024).toFixed(0) + 'GB' : ragStorage.quotaMB + 'MB'}` : ' / 无限'}</span>
+                  <input type="file" ref={ragFileRef} onChange={handleRagUpload} className="hidden" accept=".txt,.md,.csv,.json,.log,.xml,.html,.htm" />
+                  <button onClick={() => ragFileRef.current?.click()} disabled={ragUploading} className="px-4 py-2 bg-indigo-600 text-white text-sm font-bold rounded-xl flex items-center gap-2 hover:bg-indigo-700 disabled:opacity-50 transition-colors">
+                    <Upload size={16} /> {ragUploading ? '上传中...' : '上传文档'}
+                  </button>
+                </div>
+              </div>
+
+              <div className="bg-blue-50 border border-blue-200 rounded-2xl p-4 text-sm text-blue-700">
+                <p className="font-bold mb-1">使用说明</p>
+                <p>上传文本文件后，系统自动进行分块和向量化。在调度中心发送问题时，开启 <span className="font-mono bg-blue-100 px-1 rounded">RAG</span> 按钮，AI 将自动从知识库检索相关内容增强回答。</p>
+                <p className="mt-1 text-xs text-blue-500">支持格式：.txt .md .csv .json .log .xml .html · 单文件最大 20MB</p>
+              </div>
+
+              {ragDocs.length === 0 ? (
+                <div className="bg-white border border-gray-200 rounded-2xl p-12 text-center">
+                  <FileText size={40} className="mx-auto text-gray-200 mb-3" />
+                  <p className="text-gray-400 text-sm">暂无文档，点击"上传文档"开始构建知识库</p>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {ragDocs.map(doc => (
+                    <div key={doc.id} className="bg-white border border-gray-200 rounded-2xl p-4 flex items-center justify-between hover:shadow-sm transition-shadow">
+                      <div className="flex items-center gap-3 min-w-0 flex-1">
+                        <div className="w-10 h-10 bg-indigo-50 rounded-xl flex items-center justify-center flex-shrink-0">
+                          <FileText size={18} className="text-indigo-500" />
+                        </div>
+                        <div className="min-w-0">
+                          <p className="font-bold text-gray-800 text-sm truncate">{doc.originalName}</p>
+                          <p className="text-xs text-gray-400">{doc.chunks} 个分块 · {new Date(doc.createdAt).toLocaleString()}</p>
+                        </div>
+                      </div>
+                      <button onClick={() => handleRagDelete(doc.id)} className="p-2 text-gray-400 hover:text-red-500 transition-colors flex-shrink-0" title="删除文档">
+                        <Trash2 size={16} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
         );
@@ -1209,9 +2566,12 @@ export default function App() {
   const [dbUsers, setDbUsers] = useState([]);
   const [isTestMode, setIsTestMode] = useState(true);
   const [adminKeys, setAdminKeys] = useState({});
-  const [alertsConfig, setAlertsConfig] = useState({ email: '', phone: '', wechat: '', smtpServer: '', smtpPort: '', emailPwd: '', smsProvider: 'aliyun', smsAppKey: '' });
+  const [alertsConfig, setAlertsConfig] = useState({ email: '', phone: '', wechat: '', smtpServer: '', smtpPort: '', emailPwd: '', smsProvider: 'aliyun', smsAppKey: '', webhookWechat: '', webhookDingtalk: '' });
   const [dbLogs, setDbLogs] = useState([]);
-  
+  const [vendors, setVendors] = useState(FALLBACK_VENDORS);
+  const [strategy, setStrategy] = useState('fusion');
+  const [adminTemplates, setAdminTemplates] = useState([]);
+
   const [auth, setAuth] = useState(null); 
   const [isLoading, setIsLoading] = useState(true);
 
@@ -1228,12 +2588,14 @@ export default function App() {
           if (data.keys) setAdminKeys(data.keys);
           if (data.alerts) setAlertsConfig(data.alerts);
           if (data.logs) setDbLogs(data.logs);
+          if (data.strategy) setStrategy(data.strategy);
+          if (Array.isArray(data.vendors) && data.vendors.length > 0) setVendors(data.vendors);
+          if (Array.isArray(data.promptTemplates)) setAdminTemplates(data.promptTemplates);
         } else {
           throw new Error("后端接口未就绪");
         }
       } catch (e) {
-        console.warn("未能连接到后端服务 (Port 3000)，加载默认数据保障 UI 运行");
-        setDbUsers([{ id: 'usr_admin', username: 'admin123', password: 'admin456', role: 'admin', roleDetail: 'super', name: '系统管理员', plan: 'max', status: 'active', balance: 9999.0 }]);
+        console.warn("未能连接到后端服务 (Port 3000)，等待用户登录后重试");
       } finally {
         setIsLoading(false);
       }
@@ -1253,10 +2615,17 @@ export default function App() {
     }
   };
 
-  useEffect(() => { if (!isLoading && Object.keys(adminKeys).length > 0) syncToDatabase('admin/keys', adminKeys); }, [adminKeys, isLoading]);
-  useEffect(() => { if (!isLoading) syncToDatabase('admin/settings', { isTestMode, alertsConfig }); }, [isTestMode, alertsConfig, isLoading]);
-  useEffect(() => { if (!isLoading && dbUsers.length > 0) syncToDatabase('admin/users', dbUsers); }, [dbUsers, isLoading]);
-  useEffect(() => { if (!isLoading && dbLogs.length > 0) syncToDatabase('admin/logs', dbLogs); }, [dbLogs, isLoading]);
+  // 防抖同步：避免快速连续变更发大量请求
+  const syncTimers = useRef({});
+  const debouncedSync = useCallback((endpoint, payload, delay = 800) => {
+    if (syncTimers.current[endpoint]) clearTimeout(syncTimers.current[endpoint]);
+    syncTimers.current[endpoint] = setTimeout(() => syncToDatabase(endpoint, payload), delay);
+  }, []);
+  useEffect(() => { if (!isLoading && Object.keys(adminKeys).length > 0) debouncedSync('admin/keys', adminKeys); }, [adminKeys, isLoading]);
+  useEffect(() => { if (!isLoading) debouncedSync('admin/settings', { isTestMode, strategy, alertsConfig }); }, [isTestMode, strategy, alertsConfig, isLoading]);
+  useEffect(() => { if (!isLoading && dbUsers.length > 0) debouncedSync('admin/users', dbUsers); }, [dbUsers, isLoading]);
+  useEffect(() => { if (!isLoading && dbLogs.length > 0) debouncedSync('admin/logs', dbLogs, 2000); }, [dbLogs, isLoading]);
+  useEffect(() => { if (!isLoading && vendors.length > 0) debouncedSync('admin/vendors', vendors); }, [vendors, isLoading]);
 
   if (isLoading) {
     return <div className="flex h-screen items-center justify-center bg-gray-50"><div className="w-12 h-12 border-4 border-indigo-200 border-t-indigo-600 rounded-full animate-spin"></div></div>;
@@ -1268,11 +2637,9 @@ export default function App() {
       <AuthScreen 
         onLogin={(user) => {
           setAuth(user);
-          window.sessionStorage.setItem('token', 'session_token_' + user.id); 
-        }} 
+        }}
         onRegister={(u) => {
           setDbUsers(p => [...p, u]);
-          syncToDatabase('auth/register', u);
         }} 
         dbUsers={dbUsers} 
         isTestMode={isTestMode} 
@@ -1294,20 +2661,29 @@ export default function App() {
         setAdminKeys={setAdminKeys} 
         alertsConfig={alertsConfig} 
         setAlertsConfig={setAlertsConfig} 
-        dbLogs={dbLogs} 
+        dbLogs={dbLogs}
         setDbLogs={setDbLogs}
+        vendors={vendors}
+        setVendors={setVendors}
+        strategy={strategy}
+        setStrategy={setStrategy}
         onSwitchToUser={() => setAuth({ ...auth, role: 'user', originalRole: 'admin' })}
+        adminTemplates={adminTemplates}
+        setAdminTemplates={setAdminTemplates}
       />
     );
   } else {
     return (
-      <UserApp 
-        auth={auth} 
-        onLogout={() => setAuth(null)} 
-        isTestMode={isTestMode} 
+      <UserApp
+        auth={auth}
+        onLogout={() => setAuth(null)}
+        isTestMode={isTestMode}
         dbKeys={adminKeys}
         dbUsers={dbUsers}
+        vendors={vendors}
+        strategy={strategy}
         onSwitchToAdmin={(adminUser) => setAuth(adminUser)}
+        onUpdateAuth={(updated) => setAuth(updated)}
       />
     );
   }
