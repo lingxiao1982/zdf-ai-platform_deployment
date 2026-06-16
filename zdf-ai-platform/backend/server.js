@@ -576,9 +576,13 @@ async function ragSearch(query, userId, db, topK = 5) {
   return results.slice(0, topK);
 }
 
+let _dbCache = null;
+let _dbCacheDirty = true;
+
 function loadDb() {
+  if (_dbCache && !_dbCacheDirty) return _dbCache;
   try {
-    if (!fs.existsSync(DATA_PATH)) return defaultDb();
+    if (!fs.existsSync(DATA_PATH)) { _dbCache = defaultDb(); _dbCacheDirty = false; return _dbCache; }
     const raw = fs.readFileSync(DATA_PATH, 'utf8');
     const data = JSON.parse(raw);
     if (!Array.isArray(data.users)) data.users = defaultDb().users;
@@ -586,7 +590,14 @@ function loadDb() {
     if (!data.settings) data.settings = defaultDb().settings;
     if (!Array.isArray(data.logs)) data.logs = [];
     if (!data.histories || typeof data.histories !== 'object') data.histories = {};
-    if (!Array.isArray(data.vendors) || data.vendors.length === 0) data.vendors = DEFAULT_VENDORS;
+    if (!Array.isArray(data.vendors) || data.vendors.length === 0) {
+      data.vendors = DEFAULT_VENDORS;
+    } else {
+      const existingIds = new Set(data.vendors.map(v => v.id));
+      for (const dv of DEFAULT_VENDORS) {
+        if (!existingIds.has(dv.id)) data.vendors.push(dv);
+      }
+    }
     if (!data.usage || typeof data.usage !== 'object') data.usage = {};
     if (!Array.isArray(data.tokenLogs)) data.tokenLogs = [];
     if (!Array.isArray(data.promptTemplates)) data.promptTemplates = DEFAULT_PROMPT_TEMPLATES;
@@ -605,15 +616,21 @@ function loadDb() {
       }
     }
     if (migrated) { try { fs.writeFileSync(DATA_PATH, JSON.stringify(data, null, 2), 'utf8'); } catch {} }
+    _dbCache = data;
+    _dbCacheDirty = false;
     return data;
   } catch {
-    return defaultDb();
+    _dbCache = defaultDb();
+    _dbCacheDirty = false;
+    return _dbCache;
   }
 }
 
 function saveDb(data) {
   fs.mkdirSync(path.dirname(DATA_PATH), { recursive: true });
   writeFileAtomic.sync(DATA_PATH, JSON.stringify(data, null, 2), 'utf8');
+  _dbCache = data;
+  _dbCacheDirty = false;
 }
 
 const OPENAI_STYLE_VENDORS = {
@@ -793,6 +810,7 @@ async function chatOpenAICompatible(baseUrl, chatPath, apiKey, apiModel, systemP
   const res = await fetch(url, {
     method: 'POST',
     headers,
+    signal: AbortSignal.timeout(120_000),
     body: JSON.stringify({
       model: apiModel,
       messages: [
@@ -823,6 +841,7 @@ async function chatAnthropic(apiKey, apiModel, systemPrompt, userText, imageFile
   }
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
+    signal: AbortSignal.timeout(120_000),
     headers: {
       'x-api-key': apiKey,
       'anthropic-version': '2023-06-01',
@@ -856,6 +875,7 @@ async function chatGoogleGemini(apiKey, apiModel, systemPrompt, userText, imageF
   }
   const res = await fetch(url, {
     method: 'POST',
+    signal: AbortSignal.timeout(120_000),
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       systemInstruction: systemPrompt
@@ -1191,6 +1211,12 @@ app.post('/api/auth/change-password', requireAuth, async (req, res) => {
   res.json({ ok: true });
 });
 
+// --- 登出（清除 httpOnly cookie）---
+app.post('/api/auth/logout', (_req, res) => {
+  res.clearCookie('token', { httpOnly: true, sameSite: 'lax', path: '/' });
+  res.json({ ok: true });
+});
+
 app.get('/api/admin/system-data', requireAdmin, (_req, res) => {
   const db = loadDb();
   // 剥离密码字段，不将 hash 暴露到前端
@@ -1386,7 +1412,7 @@ app.post('/api/auth/forgot-password', authLimiter, async (req, res) => {
     }
   }
   addLog(db, 'info', user.username, '密码重置请求', `请求重置密码，邮箱: ${user.email}`);
-  res.json({ ok: true, msg: '如果该邮箱已注册，将收到重置邮件', code: resetToken.slice(0, 8).toUpperCase() });
+  res.json({ ok: true, msg: '如果该邮箱已注册，将收到重置邮件' });
 });
 
 // --- 忘记密码：验证 code 并重置 ---

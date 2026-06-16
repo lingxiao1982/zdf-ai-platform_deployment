@@ -132,6 +132,7 @@ const callGemini = async (prompt, systemPrompt = "", files = [], dispatch = null
     try {
       return await execute();
     } catch (e) {
+      if (e?.message?.startsWith('__UPGRADE__:')) throw e;
       retries++;
       await new Promise(r => setTimeout(r, Math.pow(2, retries) * 500));
       if (retries === maxRetries) return `[错误] 后端调度失败: ${e.message}`;
@@ -2088,6 +2089,7 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, onUpdate
             <select className="w-1/2 text-xs p-2 border rounded bg-white" value={config.vendor} onChange={(e) => { const vendor = vendors.find(v => v.id === e.target.value); onUpdate(role.id, { vendor: e.target.value, model: vendor.models[0] }); }}>
               <optgroup label="海外厂商">{vendors.filter(v => v.region === 'US').map(v => <option key={v.id} value={v.id}>{v.name}</option>)}</optgroup>
               <optgroup label="国内厂商">{vendors.filter(v => v.region === 'CN').map(v => <option key={v.id} value={v.id}>{v.name}</option>)}</optgroup>
+              {vendors.some(v => v.region === 'LOCAL') && <optgroup label="本地模型">{vendors.filter(v => v.region === 'LOCAL').map(v => <option key={v.id} value={v.id}>{v.name}</option>)}</optgroup>}
             </select>
             <select className="w-1/2 text-[11px] p-2 border rounded bg-white" value={config.model} onChange={(e) => onUpdate(role.id, { model: e.target.value })}>{currentVendor.models.map(m => <option key={m} value={m}>{m}</option>)}</select>
           </div>
@@ -3234,8 +3236,9 @@ export default function App() {
   const [vendors, setVendors] = useState(FALLBACK_VENDORS);
   const [strategy, setStrategy] = useState('fusion');
   const [adminTemplates, setAdminTemplates] = useState([]);
+  const [paymentSuccess, setPaymentSuccess] = useState(false);
 
-  const [auth, setAuth] = useState(null); 
+  const [auth, setAuth] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
@@ -3265,13 +3268,10 @@ export default function App() {
     };
     fetchSystemData();
 
-    // 处理支付回调 URL 参数
     const params = new URLSearchParams(window.location.search);
     if (params.get('payment') === 'success') {
-      setTimeout(() => {
-        alert('支付成功！套餐已升级，请重新登录以刷新权限。');
-        window.history.replaceState({}, '', window.location.pathname);
-      }, 500);
+      setPaymentSuccess(true);
+      window.history.replaceState({}, '', window.location.pathname);
     } else if (params.get('payment') === 'cancel') {
       window.history.replaceState({}, '', window.location.pathname);
     }
@@ -3305,19 +3305,38 @@ export default function App() {
     return <div className="flex h-screen items-center justify-center bg-gray-50"><div className="w-12 h-12 border-4 border-indigo-200 border-t-indigo-600 rounded-full animate-spin"></div></div>;
   }
 
-  // 渲染登录网关
+  const handleLogout = () => {
+    fetch(`${API_BASE_URL}/auth/logout`, { method: 'POST', headers: { Authorization: `Bearer ${window.sessionStorage.getItem('token') || ''}` } }).catch(() => {});
+    window.sessionStorage.removeItem('token');
+    setAuth(null);
+  };
+
+  const paymentBanner = paymentSuccess && (
+    <div className="fixed top-0 left-0 right-0 z-[200] flex justify-center p-4 pointer-events-none">
+      <div className="bg-emerald-600 text-white px-6 py-3 rounded-2xl shadow-2xl flex items-center gap-3 pointer-events-auto animate-bounce">
+        <CheckCircle2 size={20}/>
+        <span className="font-bold text-sm">支付成功！套餐已升级，请重新登录以刷新权限。</span>
+        <button onClick={() => setPaymentSuccess(false)} className="ml-2 p-1 hover:bg-emerald-700 rounded-lg transition-colors"><X size={16}/></button>
+      </div>
+    </div>
+  );
+
   if (!auth) {
     return (
-      <AuthScreen 
-        onLogin={(user) => {
-          setAuth(user);
-        }}
-        onRegister={(u) => {
-          setDbUsers(p => [...p, u]);
-        }} 
-        dbUsers={dbUsers} 
-        isTestMode={isTestMode} 
-      />
+      <>
+        {paymentBanner}
+        <AuthScreen
+          onLogin={(user) => {
+            setPaymentSuccess(false);
+            setAuth(user);
+          }}
+          onRegister={(u) => {
+            setDbUsers(p => [...p, u]);
+          }}
+          dbUsers={dbUsers}
+          isTestMode={isTestMode}
+        />
+      </>
     );
   }
 
@@ -3326,7 +3345,7 @@ export default function App() {
     return (
       <AdminApp 
         auth={auth} 
-        onLogout={() => setAuth(null)} 
+        onLogout={handleLogout} 
         dbUsers={dbUsers} 
         setDbUsers={setDbUsers} 
         isTestMode={isTestMode} 
@@ -3350,7 +3369,7 @@ export default function App() {
     return (
       <UserApp
         auth={auth}
-        onLogout={() => setAuth(null)}
+        onLogout={handleLogout}
         isTestMode={isTestMode}
         dbKeys={adminKeys}
         dbUsers={dbUsers}
