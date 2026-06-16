@@ -18,6 +18,8 @@ import writeFileAtomic from 'write-file-atomic';
 import { PDFParse } from 'pdf-parse';
 import mammoth from 'mammoth';
 import PDFDocument from 'pdfkit';
+import Stripe from 'stripe';
+import CryptoJS from 'crypto-js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -32,6 +34,11 @@ if (!process.env.JWT_SECRET) {
   console.warn('[安全警告] 未设置 JWT_SECRET 环境变量，已生成随机密钥。生产环境请务必设置: export JWT_SECRET="你的强密码"');
   console.warn('[安全警告] 服务器重启后旧 token 将全部失效（因为随机密钥每次不同）');
 }
+
+// --- Stripe 支付配置 ---
+const STRIPE_SECRET = process.env.STRIPE_SECRET_KEY || '';
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
+const stripe = STRIPE_SECRET ? new Stripe(STRIPE_SECRET) : null;
 
 // RAG 文件上传配置
 const ragStorage = multer.diskStorage({
@@ -158,7 +165,9 @@ function defaultAlerts() {
     smtpPort: '',
     emailPwd: '',
     smsProvider: 'aliyun',
-    smsAppKey: '',
+    smsAppKey: '',       // 格式: AccessKeyId:AccessKeySecret
+    smsSign: 'ZDF.AI',   // 阿里云短信签名
+    smsTemplate: '',     // 阿里云短信模板编号 如 SMS_123456
     webhookWechat: '',   // 企业微信 Webhook URL
     webhookDingtalk: '', // 钉钉 Webhook URL
   };
@@ -344,6 +353,30 @@ const DEFAULT_PROMPT_TEMPLATES = [
   { id: 'tpl_10', category: '企业', title: '会议纪要整理', desc: '将会议内容结构化整理', prompt: '请将以下会议记录整理为标准会议纪要：\n1. 会议基本信息\n2. 议题与讨论要点\n3. 决议事项\n4. 待办任务（含负责人和截止日期）\n5. 下次会议安排\n\n会议记录：{input}', icon: 'ClipboardList', plan: 'enterprise' },
 ];
 
+const DEFAULT_WORKFLOWS = [
+  {
+    id: 'wf_default_pipeline', name: '四级决策流水线', builtin: true, active: true,
+    steps: [
+      { id: 'A', role: '生成者', systemPrompt: '直接回答用户问题。', inputTemplate: '{input}' },
+      { id: 'B', role: '校核者', systemPrompt: '你是一个严格的事实校核员。', inputTemplate: '问题: {input}\n初稿:\n{A}\n任务: 事实校核。' },
+      { id: 'C', role: '审核者', systemPrompt: '你是一个专业的审核专家。', inputTemplate: '校核稿:\n{B}\n任务: 润色。' },
+      { id: 'D', role: '终审者', systemPrompt: '', inputTemplate: '原始问题: {input}\n\n阶段A（生成者）输出:\n{A}\n\n阶段B（校核者）输出:\n{B}\n\n阶段C（审核者）输出:\n{C}\n\n任务: 作为终审者，根据策略输出最终纯文本结果。' },
+    ],
+  },
+  {
+    id: 'wf_single', name: '快速单模型', builtin: true, active: true,
+    steps: [{ id: 'A', role: '直接生成', systemPrompt: '', inputTemplate: '{input}' }],
+  },
+  {
+    id: 'wf_cross_verify', name: '双模型交叉验证', builtin: true, active: true,
+    steps: [
+      { id: 'A', role: '生成者 A', systemPrompt: '请直接回答用户问题。', inputTemplate: '{input}' },
+      { id: 'B', role: '独立生成 B', systemPrompt: '请独立回答用户问题，提供你自己的分析。', inputTemplate: '{input}' },
+      { id: 'C', role: '比对合并', systemPrompt: '请比较以下两个独立回答，取其精华合并为一个最佳答案。', inputTemplate: '问题: {input}\n\n回答A:\n{A}\n\n回答B:\n{B}\n\n请合并出最佳答案。' },
+    ],
+  },
+];
+
 function defaultDb() {
   return {
     users: [
@@ -368,8 +401,11 @@ function defaultDb() {
     tokenLogs: [],   // [{ ts, userId, vendor, model, roleId, inputTokens, outputTokens, cost }]
     promptTemplates: DEFAULT_PROMPT_TEMPLATES,
     userApiKeys: [],  // [{ key, userId, name, createdAt, lastUsed }]
-    ragDocs: [],      // [{ id, userId, filename, originalName, chunks: number, createdAt }]
+    ragDocs: [],      // [{ id, userId, filename, originalName, chunks, createdAt, scope?, orgId? }]
+    workflows: DEFAULT_WORKFLOWS,
+    orgs: [],            // [{ id, name, ownerId, members: [{ userId, role }], createdAt }]
     upgradeRequests: [], // [{ id, userId, username, fromPlan, toPlan, message, status, createdAt, reviewedAt, reviewNote }]
+    orders: [],          // [{ id, userId, plan, amount, currency, provider, status, createdAt, paidAt, externalId }]
   };
 }
 
@@ -517,16 +553,23 @@ function cosineSim(a, b) {
   return na && nb ? dot / (Math.sqrt(na) * Math.sqrt(nb)) : 0;
 }
 
-/** RAG 搜索：返回最相关的 topK 个文本块 */
+function getUserOrgIds(userId, db) {
+  return (db.orgs || []).filter(o => o.members.some(m => m.userId === userId)).map(o => o.id);
+}
+
+/** RAG 搜索：返回最相关的 topK 个文本块（含个人 + 所属组织文档） */
 async function ragSearch(query, userId, db, topK = 5) {
   const [queryVec] = await getEmbeddings([query], db);
   const results = [];
-  const userDocs = (db.ragDocs || []).filter(d => d.userId === userId);
-  for (const doc of userDocs) {
+  const orgIds = getUserOrgIds(userId, db);
+  const docs = (db.ragDocs || []).filter(d =>
+    d.userId === userId || (d.scope === 'org' && orgIds.includes(d.orgId))
+  );
+  for (const doc of docs) {
     const chunks = ragVectorStore.get(doc.id) || [];
     for (const chunk of chunks) {
       const score = cosineSim(queryVec, chunk.embedding);
-      results.push({ text: chunk.text, score, docName: doc.originalName });
+      results.push({ text: chunk.text, score, docName: doc.originalName, scope: doc.scope || 'personal' });
     }
   }
   results.sort((a, b) => b.score - a.score);
@@ -549,7 +592,10 @@ function loadDb() {
     if (!Array.isArray(data.promptTemplates)) data.promptTemplates = DEFAULT_PROMPT_TEMPLATES;
     if (!Array.isArray(data.userApiKeys)) data.userApiKeys = [];
     if (!Array.isArray(data.ragDocs)) data.ragDocs = [];
+    if (!Array.isArray(data.workflows) || data.workflows.length === 0) data.workflows = DEFAULT_WORKFLOWS;
+    if (!Array.isArray(data.orgs)) data.orgs = [];
     if (!Array.isArray(data.upgradeRequests)) data.upgradeRequests = [];
+    if (!Array.isArray(data.orders)) data.orders = [];
     // 迁移：将明文密码自动 hash（兼容旧 store.json）
     let migrated = false;
     for (const u of data.users) {
@@ -577,6 +623,9 @@ const OPENAI_STYLE_VENDORS = {
   zhipu: { base: 'https://open.bigmodel.cn/api/paas/v4', path: '/chat/completions' },
   alibaba: { base: 'https://dashscope.aliyuncs.com/compatible-mode', path: '/v1/chat/completions' },
   doubao: { base: 'https://ark.cn-beijing.volces.com/api/v3', path: '/chat/completions' },
+  ollama: { base: process.env.OLLAMA_BASE_URL || 'http://localhost:11434', path: '/v1/chat/completions' },
+  vllm:   { base: process.env.VLLM_BASE_URL   || 'http://localhost:8000', path: '/v1/chat/completions' },
+  localai: { base: process.env.LOCALAI_BASE_URL || 'http://localhost:8080', path: '/v1/chat/completions' },
 };
 
 const DEFAULT_VENDORS = [
@@ -588,6 +637,8 @@ const DEFAULT_VENDORS = [
   { id: 'zhipu', name: 'Zhipu (智谱)', region: 'CN', models: ['glm-5.1', 'glm-5', 'glm-4-plus', 'glm-4'] },
   { id: 'doubao', name: 'Doubao (豆包)', region: 'CN', models: ['doubao-seed-2.0-pro', 'doubao-seed-2.0-lite', 'doubao-seed-2.0-code', 'doubao-pro-128k'] },
   { id: 'moonshot', name: 'Moonshot (月之暗面)', region: 'CN', models: ['kimi-k2.6', 'kimi-k2.5', 'moonshot-v1-128k'] },
+  { id: 'ollama', name: 'Ollama (本地)', region: 'LOCAL', models: ['llama3.3', 'qwen2.5', 'deepseek-r1', 'codellama', 'mistral', 'gemma2'] },
+  { id: 'vllm', name: 'vLLM (本地)', region: 'LOCAL', models: ['自定义模型'] },
 ];
 
 /**
@@ -647,6 +698,10 @@ function resolveApiModel(vendor, model) {
     if (/seed.*lite|2\.0.*lite/i.test(m)) return 'doubao-seed-2.0-lite';
     if (/128k/i.test(m)) return 'doubao-pro-128k';
     return 'doubao-seed-2.0-lite';
+  }
+  // 本地模型（Ollama / vLLM / LocalAI）: 直接透传模型名
+  if (['ollama', 'vllm', 'localai'].includes(vendor)) {
+    return m || 'llama3.3';
   }
   return m.replace(/\s*\(.*?\)\s*/g, '').trim() || 'gpt-4.1-mini';
 }
@@ -733,12 +788,11 @@ async function chatOpenAICompatible(baseUrl, chatPath, apiKey, apiModel, systemP
   } else {
     userContent = userText;
   }
+  const headers = { 'Content-Type': 'application/json' };
+  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
   const res = await fetch(url, {
     method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
+    headers,
     body: JSON.stringify({
       model: apiModel,
       messages: [
@@ -865,7 +919,8 @@ async function runDispatchLLM(prompt, systemPrompt, dispatch, keysFromDb, files)
   // 过滤出有 base64 数据的图片附件
   const imageFiles = (files || []).filter(f => f.isImage && f.data);
 
-  if (!apiKey) {
+  const isLocalVendor = ['ollama', 'vllm', 'localai'].includes(vendor);
+  if (!apiKey && !isLocalVendor) {
     const est = estimateTokens(userText);
     return { text: buildStubReply(dispatch, prompt, ''), stub: true, inputTokens: est, outputTokens: Math.ceil(est * 0.5), apiModel };
   }
@@ -897,6 +952,18 @@ async function runDispatchLLM(prompt, systemPrompt, dispatch, keysFromDb, files)
   }
 }
 
+// --- SLA 追踪 ---
+const SLA_START_TIME = Date.now();
+const slaMetrics = {
+  totalRequests: 0,
+  totalErrors: 0,  // 5xx
+  responseTimes: [], // last 1000 API response times in ms
+  aiResponseTimes: [], // last 500 AI generate response times
+  hourlyUptime: {},  // { "2026-06-15T14": { ok: 120, err: 2 } }
+};
+const SLA_MAX_RT = 1000;
+const SLA_MAX_AI_RT = 500;
+
 const app = express();
 app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
 const ALLOWED_ORIGINS = process.env.CORS_ORIGINS
@@ -908,6 +975,64 @@ app.use(cors({
     : true,
   credentials: true,
 }));
+
+// SLA 响应时间追踪中间件
+app.use((req, res, next) => {
+  if (!req.path.startsWith('/api/')) return next();
+  const start = Date.now();
+  slaMetrics.totalRequests++;
+  const hourKey = new Date().toISOString().slice(0, 13);
+  if (!slaMetrics.hourlyUptime[hourKey]) slaMetrics.hourlyUptime[hourKey] = { ok: 0, err: 0 };
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    slaMetrics.responseTimes.push(duration);
+    if (slaMetrics.responseTimes.length > SLA_MAX_RT) slaMetrics.responseTimes.shift();
+    if (res.statusCode >= 500) {
+      slaMetrics.totalErrors++;
+      slaMetrics.hourlyUptime[hourKey].err++;
+    } else {
+      slaMetrics.hourlyUptime[hourKey].ok++;
+    }
+  });
+  next();
+});
+
+// Stripe webhook 必须在 express.json() 之前注册（需要 raw body 验签）
+app.post('/api/payment/stripe/webhook', express.raw({ type: 'application/json' }), (req, res) => {
+  if (!stripe) return res.status(503).send('Stripe not configured');
+  let event;
+  try {
+    if (STRIPE_WEBHOOK_SECRET) {
+      event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], STRIPE_WEBHOOK_SECRET);
+    } else {
+      event = JSON.parse(req.body.toString());
+    }
+  } catch (e) {
+    console.error('[Stripe Webhook] 签名验证失败:', e.message);
+    return res.status(400).send(`Webhook Error: ${e.message}`);
+  }
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const { userId, plan, orderId } = session.metadata || {};
+    if (userId && plan) {
+      const db = loadDb();
+      const order = db.orders.find(o => o.id === orderId);
+      if (order) {
+        order.status = 'paid';
+        order.paidAt = new Date().toISOString();
+        order.externalId = session.subscription || session.id;
+      }
+      const user = db.users.find(u => u.id === userId);
+      if (user && PLAN_PRICES[plan]) {
+        user.plan = plan;
+        console.log(`[Stripe] 用户 ${user.username} 升级到 ${plan}`);
+      }
+      saveDb(db);
+    }
+  }
+  res.json({ received: true });
+});
+
 app.use(express.json({ limit: '32mb' }));
 app.use(authMiddleware);
 
@@ -1165,6 +1290,19 @@ app.get('/api/vendors', (_req, res) => {
   res.json({ vendors: db.vendors || DEFAULT_VENDORS });
 });
 
+app.get('/api/ollama/models', async (_req, res) => {
+  const base = process.env.OLLAMA_BASE_URL || 'http://localhost:11434';
+  try {
+    const r = await fetch(`${base}/api/tags`, { signal: AbortSignal.timeout(3000) });
+    if (!r.ok) return res.json({ ok: false, models: [] });
+    const data = await r.json();
+    const models = (data.models || []).map(m => ({ name: m.name, size: m.size, modified: m.modified_at }));
+    res.json({ ok: true, models });
+  } catch {
+    res.json({ ok: false, models: [], error: 'Ollama 未运行或无法连接' });
+  }
+});
+
 app.post('/api/admin/vendors', requireAdmin, (req, res) => {
   const db = loadDb();
   if (Array.isArray(req.body)) db.vendors = req.body;
@@ -1194,6 +1332,7 @@ app.post('/api/auth/register', registerLimiter, async (req, res) => {
     id: `usr_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
     username: u.username.trim(),
     password: await bcrypt.hash(u.password, BCRYPT_ROUNDS),
+    email: (u.email || '').trim().toLowerCase().slice(0, 100) || '',
     role: 'user',
     roleDetail: 'user',
     name: (u.name || u.username).trim().slice(0, 50),
@@ -1206,7 +1345,207 @@ app.post('/api/auth/register', registerLimiter, async (req, res) => {
   saveDb(db);
   const token = jwt.sign({ userId: safeUser.id, role: safeUser.role, plan: safeUser.plan }, JWT_SECRET, { expiresIn: '24h' });
   res.cookie('token', token, { httpOnly: true, sameSite: 'lax', maxAge: 24 * 60 * 60 * 1000, path: '/' });
-  res.json({ ok: true, token, user: { id: safeUser.id, username: safeUser.username, role: safeUser.role, roleDetail: safeUser.roleDetail, name: safeUser.name, plan: safeUser.plan, status: safeUser.status, balance: safeUser.balance } });
+  res.json({ ok: true, token, user: { id: safeUser.id, username: safeUser.username, role: safeUser.role, roleDetail: safeUser.roleDetail, name: safeUser.name, plan: safeUser.plan, status: safeUser.status, balance: safeUser.balance, email: safeUser.email } });
+});
+
+// --- 忘记密码：发送重置邮件 ---
+app.post('/api/auth/forgot-password', authLimiter, async (req, res) => {
+  const { email } = req.body || {};
+  if (!email) return res.status(400).json({ ok: false, error: '请提供注册邮箱' });
+  const db = loadDb();
+  const user = db.users.find(u => u.email && u.email.toLowerCase() === email.toLowerCase().trim());
+  if (!user) {
+    return res.json({ ok: true, msg: '如果该邮箱已注册，将收到重置邮件' });
+  }
+  const resetToken = Math.random().toString(36).slice(2) + Date.now().toString(36) + Math.random().toString(36).slice(2);
+  if (!db.resetTokens) db.resetTokens = [];
+  db.resetTokens = db.resetTokens.filter(t => t.userId !== user.id);
+  db.resetTokens.push({ token: resetToken, userId: user.id, expiresAt: Date.now() + 3600_000 });
+  if (db.resetTokens.length > 500) db.resetTokens = db.resetTokens.slice(-500);
+  saveDb(db);
+  const cfg = db.settings?.alertsConfig || defaultAlerts();
+  const server = (cfg.smtpServer || '').trim();
+  const smtpEmail = (cfg.email || '').trim();
+  const pwd = (cfg.emailPwd || '').trim();
+  if (server && smtpEmail && pwd) {
+    try {
+      const transporter = nodemailer.createTransport({
+        host: server, port: Number(cfg.smtpPort) || 465,
+        secure: (Number(cfg.smtpPort) || 465) === 465,
+        auth: { user: smtpEmail, pass: pwd },
+        tls: { rejectUnauthorized: false },
+      });
+      await transporter.sendMail({
+        from: `"ZDF.AI" <${smtpEmail}>`,
+        to: user.email,
+        subject: '[ZDF.AI] 密码重置',
+        html: `<h2>密码重置</h2><p>您的密码重置验证码为：</p><h1 style="color:#6366f1;letter-spacing:4px">${resetToken.slice(0, 8).toUpperCase()}</h1><p>验证码 1 小时内有效。如非本人操作请忽略。</p><hr><p style="color:#999">ZDF.AI 多智能体决策系统</p>`,
+      });
+    } catch (e) {
+      console.warn('[密码重置] 邮件发送失败:', e.message);
+    }
+  }
+  addLog(db, 'info', user.username, '密码重置请求', `请求重置密码，邮箱: ${user.email}`);
+  res.json({ ok: true, msg: '如果该邮箱已注册，将收到重置邮件', code: resetToken.slice(0, 8).toUpperCase() });
+});
+
+// --- 忘记密码：验证 code 并重置 ---
+app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
+  const { email, code, newPassword } = req.body || {};
+  if (!email || !code || !newPassword) return res.status(400).json({ ok: false, error: '请提供邮箱、验证码和新密码' });
+  if (newPassword.length < 6) return res.status(400).json({ ok: false, error: '新密码至少 6 位' });
+  const db = loadDb();
+  const user = db.users.find(u => u.email && u.email.toLowerCase() === email.toLowerCase().trim());
+  if (!user) return res.status(400).json({ ok: false, error: '邮箱未注册' });
+  const tokenRow = (db.resetTokens || []).find(t => t.userId === user.id && t.expiresAt > Date.now());
+  if (!tokenRow) return res.status(400).json({ ok: false, error: '验证码无效或已过期' });
+  if (!tokenRow.token.toUpperCase().startsWith(code.toUpperCase().trim())) {
+    return res.status(400).json({ ok: false, error: '验证码错误' });
+  }
+  user.password = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
+  db.resetTokens = db.resetTokens.filter(t => t.userId !== user.id);
+  addLog(db, 'info', user.username, '密码重置成功', '用户通过邮箱验证码重置了密码');
+  saveDb(db);
+  res.json({ ok: true });
+});
+
+// --- OAuth: GitHub 登录 ---
+app.get('/api/auth/github', (req, res) => {
+  const db = loadDb();
+  const cfg = db.settings?.oauthConfig?.github || {};
+  if (!cfg.clientId) return res.status(400).json({ ok: false, error: 'GitHub OAuth 未配置' });
+  const state = Math.random().toString(36).slice(2);
+  const redirectUri = `${req.protocol}://${req.get('host')}/api/auth/github/callback`;
+  res.json({ ok: true, url: `https://github.com/login/oauth/authorize?client_id=${encodeURIComponent(cfg.clientId)}&redirect_uri=${encodeURIComponent(redirectUri)}&state=${state}&scope=user:email` });
+});
+
+app.get('/api/auth/github/callback', async (req, res) => {
+  const { code } = req.query;
+  if (!code) return res.status(400).send('Missing code');
+  const db = loadDb();
+  const cfg = db.settings?.oauthConfig?.github || {};
+  if (!cfg.clientId || !cfg.clientSecret) return res.status(400).send('GitHub OAuth not configured');
+  try {
+    const tokenRes = await fetch('https://github.com/login/oauth/access_token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ client_id: cfg.clientId, client_secret: cfg.clientSecret, code }),
+    });
+    const tokenData = await tokenRes.json();
+    if (!tokenData.access_token) return res.status(400).send('OAuth token exchange failed');
+    const userRes = await fetch('https://api.github.com/user', {
+      headers: { Authorization: `Bearer ${tokenData.access_token}`, 'User-Agent': 'ZDF.AI' },
+    });
+    const ghUser = await userRes.json();
+    const emailRes = await fetch('https://api.github.com/user/emails', {
+      headers: { Authorization: `Bearer ${tokenData.access_token}`, 'User-Agent': 'ZDF.AI' },
+    });
+    const emails = await emailRes.json();
+    const primaryEmail = (Array.isArray(emails) ? emails.find(e => e.primary)?.email : '') || ghUser.email || '';
+    let user = db.users.find(u => u.oauthGithub === String(ghUser.id)) || db.users.find(u => u.email && primaryEmail && u.email.toLowerCase() === primaryEmail.toLowerCase());
+    if (!user) {
+      const isTest = db.settings?.isTestMode;
+      user = {
+        id: `usr_gh_${ghUser.id}`,
+        username: ghUser.login || `gh_${ghUser.id}`,
+        password: await bcrypt.hash(Math.random().toString(36).slice(2) + Date.now(), BCRYPT_ROUNDS),
+        email: primaryEmail,
+        role: 'user', roleDetail: 'user',
+        name: ghUser.name || ghUser.login,
+        plan: isTest ? 'pro' : 'free',
+        status: 'active', balance: 0.0,
+        oauthGithub: String(ghUser.id),
+        avatar: ghUser.avatar_url || '',
+      };
+      db.users.push(user);
+      addLog(db, 'info', user.username, 'GitHub 注册', `通过 GitHub OAuth 注册`);
+    } else {
+      if (!user.oauthGithub) user.oauthGithub = String(ghUser.id);
+      if (ghUser.avatar_url) user.avatar = ghUser.avatar_url;
+    }
+    saveDb(db);
+    const jwtToken = jwt.sign({ userId: user.id, role: user.role, plan: user.plan }, JWT_SECRET, { expiresIn: '24h' });
+    res.redirect(`/?oauth_token=${jwtToken}`);
+  } catch (e) {
+    res.status(500).send(`OAuth error: ${e.message}`);
+  }
+});
+
+// --- OAuth: Google 登录 ---
+app.get('/api/auth/google', (req, res) => {
+  const db = loadDb();
+  const cfg = db.settings?.oauthConfig?.google || {};
+  if (!cfg.clientId) return res.status(400).json({ ok: false, error: 'Google OAuth 未配置' });
+  const redirectUri = `${req.protocol}://${req.get('host')}/api/auth/google/callback`;
+  const state = Math.random().toString(36).slice(2);
+  res.json({ ok: true, url: `https://accounts.google.com/o/oauth2/v2/auth?client_id=${encodeURIComponent(cfg.clientId)}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=openid%20email%20profile&state=${state}` });
+});
+
+app.get('/api/auth/google/callback', async (req, res) => {
+  const { code } = req.query;
+  if (!code) return res.status(400).send('Missing code');
+  const db = loadDb();
+  const cfg = db.settings?.oauthConfig?.google || {};
+  if (!cfg.clientId || !cfg.clientSecret) return res.status(400).send('Google OAuth not configured');
+  try {
+    const redirectUri = `${req.protocol}://${req.get('host')}/api/auth/google/callback`;
+    const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ code, client_id: cfg.clientId, client_secret: cfg.clientSecret, redirect_uri: redirectUri, grant_type: 'authorization_code' }),
+    });
+    const tokenData = await tokenRes.json();
+    if (!tokenData.access_token) return res.status(400).send('Token exchange failed');
+    const infoRes = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+      headers: { Authorization: `Bearer ${tokenData.access_token}` },
+    });
+    const gUser = await infoRes.json();
+    let user = db.users.find(u => u.oauthGoogle === gUser.id) || db.users.find(u => u.email && gUser.email && u.email.toLowerCase() === gUser.email.toLowerCase());
+    if (!user) {
+      const isTest = db.settings?.isTestMode;
+      user = {
+        id: `usr_gg_${gUser.id}`,
+        username: (gUser.email || '').split('@')[0] || `gg_${gUser.id}`,
+        password: await bcrypt.hash(Math.random().toString(36).slice(2) + Date.now(), BCRYPT_ROUNDS),
+        email: gUser.email || '',
+        role: 'user', roleDetail: 'user',
+        name: gUser.name || gUser.email,
+        plan: isTest ? 'pro' : 'free',
+        status: 'active', balance: 0.0,
+        oauthGoogle: gUser.id,
+        avatar: gUser.picture || '',
+      };
+      db.users.push(user);
+      addLog(db, 'info', user.username, 'Google 注册', `通过 Google OAuth 注册`);
+    } else {
+      if (!user.oauthGoogle) user.oauthGoogle = gUser.id;
+      if (gUser.picture) user.avatar = gUser.picture;
+    }
+    saveDb(db);
+    const jwtToken = jwt.sign({ userId: user.id, role: user.role, plan: user.plan }, JWT_SECRET, { expiresIn: '24h' });
+    res.redirect(`/?oauth_token=${jwtToken}`);
+  } catch (e) {
+    res.status(500).send(`OAuth error: ${e.message}`);
+  }
+});
+
+// --- OAuth 配置查询 (前端用) ---
+app.get('/api/auth/oauth-config', (_req, res) => {
+  const db = loadDb();
+  const oa = db.settings?.oauthConfig || {};
+  res.json({
+    github: !!(oa.github?.clientId),
+    google: !!(oa.google?.clientId),
+  });
+});
+
+// --- 管理员: 保存 OAuth 配置 ---
+app.post('/api/admin/oauth-config', requireAdmin, (req, res) => {
+  const db = loadDb();
+  if (!db.settings) db.settings = {};
+  db.settings.oauthConfig = { ...(db.settings.oauthConfig || {}), ...(req.body || {}) };
+  saveDb(db);
+  res.json({ ok: true });
 });
 
 app.get('/api/user/history', (req, res) => {
@@ -1336,8 +1675,11 @@ app.post('/api/ai/generate', generateLimiter, async (req, res) => {
     }
   }
 
+  const aiStartTime = Date.now();
   try {
     const { text, stub, inputTokens, outputTokens, apiModel } = await runDispatchLLM(finalPrompt, systemPrompt, dispatch, db.keys, req.body?.files);
+    slaMetrics.aiResponseTimes.push(Date.now() - aiStartTime);
+    if (slaMetrics.aiResponseTimes.length > SLA_MAX_AI_RT) slaMetrics.aiResponseTimes.shift();
 
     // --- 4. 记录使用量 ---
     if (userId) {
@@ -1367,8 +1709,32 @@ app.post('/api/ai/generate', generateLimiter, async (req, res) => {
       // 只保留最近 5000 条 token 日志
       if (dbAfter.tokenLogs.length > 5000) dbAfter.tokenLogs = dbAfter.tokenLogs.slice(-5000);
 
+      // --- 超额预警：自动触发告警 ---
+      if (limits.dailyTasks > 0 && user) {
+        const pct = dayUsage.tasks / limits.dailyTasks;
+        const prevPct = (dayUsage.tasks - 1) / limits.dailyTasks;
+        if (pct >= 1 && prevPct < 1) {
+          const cfg = dbAfter.settings?.alertsConfig || defaultAlerts();
+          const msg = `用户 ${user.username}（${plan}）达到每日上限 ${limits.dailyTasks} 次`;
+          sendWebhookAlert(cfg, '超额预警：用户达到上限', msg).catch(() => {});
+          sendEmailAlert(cfg, '超额预警：用户达到上限', msg).catch(() => {});
+          addLog(dbAfter, 'warn', user.username, '超额预警', msg);
+        } else if (pct >= 0.8 && prevPct < 0.8) {
+          addLog(dbAfter, 'warn', user.username, '用量预警', `用户已使用 ${Math.round(pct * 100)}% 每日任务额度（${dayUsage.tasks}/${limits.dailyTasks}）`);
+        }
+      }
+
       saveDb(dbAfter);
     }
+
+    const usageWarning = (userId && limits.dailyTasks > 0) ? (() => {
+      const dbCheck = loadDb();
+      const du = dbCheck.usage[userId]?.[today];
+      if (!du) return null;
+      const pct = Math.round(du.tasks / limits.dailyTasks * 100);
+      if (pct >= 80) return { pct, used: du.tasks, limit: limits.dailyTasks };
+      return null;
+    })() : null;
 
     res.json({
       result: text,
@@ -1377,6 +1743,7 @@ app.post('/api/ai/generate', generateLimiter, async (req, res) => {
         stub, vendor: dispatch?.vendor, model: dispatch?.model, roleId: dispatch?.roleId,
         inputTokens, outputTokens, truncated: finalPrompt !== prompt,
       },
+      usageWarning,
     });
   } finally {
     if (userId && limits.concurrency > 0) {
@@ -1457,6 +1824,163 @@ app.post('/api/admin/upgrade-requests/:id/review', requireAdmin, (req, res) => {
   }
   saveDb(db);
   res.json({ ok: true, request });
+});
+
+// ============================================================
+//  Phase 3: 支付集成 — Stripe (欧洲) + 支付宝 (中国)
+// ============================================================
+const PLAN_PRICES = {
+  pro:        { eur: 2900, rmb: 19900, label_eur: '€29/月', label_rmb: '¥199/月' },  // 单位: 分
+  enterprise: { eur: 49900, rmb: 499900, label_eur: '€499/月', label_rmb: '¥4999/月' },
+};
+
+// --- Stripe Checkout Session 创建 ---
+app.post('/api/payment/stripe/create-checkout', requireAuth, async (req, res) => {
+  if (!stripe) return res.status(503).json({ ok: false, error: 'Stripe 未配置。请设置环境变量 STRIPE_SECRET_KEY' });
+  const { plan } = req.body || {};
+  const pricing = PLAN_PRICES[plan];
+  if (!pricing) return res.status(400).json({ ok: false, error: '无效的套餐' });
+
+  const db = loadDb();
+  const user = db.users.find(u => u.id === req.userId);
+  if (!user) return res.status(404).json({ ok: false, error: '用户不存在' });
+  if (user.plan === plan) return res.status(400).json({ ok: false, error: '已经是该套餐' });
+
+  try {
+    const orderId = `ord_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      payment_method_types: ['card'],
+      line_items: [{
+        price_data: {
+          currency: 'eur',
+          unit_amount: pricing.eur,
+          recurring: { interval: 'month' },
+          product_data: { name: `ZDF.AI ${plan.charAt(0).toUpperCase() + plan.slice(1)}`, description: `ZDF.AI ${plan} 套餐月订阅` },
+        },
+        quantity: 1,
+      }],
+      client_reference_id: orderId,
+      metadata: { userId: req.userId, plan, orderId },
+      success_url: `${req.headers.origin || 'http://localhost:8080'}/?payment=success&order=${orderId}`,
+      cancel_url: `${req.headers.origin || 'http://localhost:8080'}/?payment=cancel`,
+    });
+
+    db.orders.push({
+      id: orderId, userId: req.userId, plan, amount: pricing.eur, currency: 'eur',
+      provider: 'stripe', status: 'pending', createdAt: new Date().toISOString(),
+      externalId: session.id,
+    });
+    saveDb(db);
+
+    res.json({ ok: true, url: session.url, orderId });
+  } catch (e) {
+    console.error('[Stripe] Checkout 创建失败:', e.message);
+    res.status(500).json({ ok: false, error: `Stripe 错误: ${e.message}` });
+  }
+});
+
+// --- 支付宝 H5 支付（服务端签名，生成跳转 URL） ---
+app.post('/api/payment/alipay/create-order', requireAuth, async (req, res) => {
+  const alipayAppId = process.env.ALIPAY_APP_ID || '';
+  const alipayPrivateKey = process.env.ALIPAY_PRIVATE_KEY || '';
+  if (!alipayAppId || !alipayPrivateKey) {
+    return res.status(503).json({ ok: false, error: '支付宝未配置。请设置环境变量 ALIPAY_APP_ID 和 ALIPAY_PRIVATE_KEY' });
+  }
+
+  const { plan } = req.body || {};
+  const pricing = PLAN_PRICES[plan];
+  if (!pricing) return res.status(400).json({ ok: false, error: '无效的套餐' });
+
+  const db = loadDb();
+  const user = db.users.find(u => u.id === req.userId);
+  if (!user) return res.status(404).json({ ok: false, error: '用户不存在' });
+  if (user.plan === plan) return res.status(400).json({ ok: false, error: '已经是该套餐' });
+
+  const orderId = `ord_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+  const amountYuan = (pricing.rmb / 100).toFixed(2);
+
+  // 构造支付宝 H5 支付参数
+  const bizContent = JSON.stringify({
+    out_trade_no: orderId,
+    total_amount: amountYuan,
+    subject: `ZDF.AI ${plan} 套餐`,
+    product_code: 'QUICK_WAP_WAY',
+  });
+
+  const timestamp = new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, '');
+  const params = {
+    app_id: alipayAppId,
+    method: 'alipay.trade.wap.pay',
+    format: 'JSON',
+    charset: 'utf-8',
+    sign_type: 'RSA2',
+    timestamp,
+    version: '1.0',
+    notify_url: `${process.env.ALIPAY_NOTIFY_URL || `http://localhost:${PORT}/api/payment/alipay/notify`}`,
+    return_url: `${req.headers.origin || 'http://localhost:8080'}/?payment=success&order=${orderId}`,
+    biz_content: bizContent,
+  };
+
+  // RSA2 签名
+  try {
+    const { createSign } = await import('crypto');
+    const sorted = Object.keys(params).sort().filter(k => params[k]).map(k => `${k}=${params[k]}`).join('&');
+    const signer = createSign('RSA-SHA256');
+    signer.update(sorted);
+    const sign = signer.sign(alipayPrivateKey, 'base64');
+    params.sign = sign;
+
+    const formFields = Object.entries(params).map(([k, v]) => `<input type="hidden" name="${k}" value="${v.replace(/"/g, '&quot;')}">`).join('');
+    const formHtml = `<html><body><form id="f" action="https://openapi.alipay.com/gateway.do" method="POST">${formFields}</form><script>document.getElementById('f').submit();</script></body></html>`;
+
+    db.orders.push({
+      id: orderId, userId: req.userId, plan, amount: pricing.rmb, currency: 'cny',
+      provider: 'alipay', status: 'pending', createdAt: new Date().toISOString(), externalId: '',
+    });
+    saveDb(db);
+
+    res.json({ ok: true, orderId, formHtml, amount: amountYuan });
+  } catch (e) {
+    console.error('[Alipay] 签名失败:', e.message);
+    res.status(500).json({ ok: false, error: `支付宝签名错误: ${e.message}` });
+  }
+});
+
+// --- 支付宝异步通知回调 ---
+app.post('/api/payment/alipay/notify', express.urlencoded({ extended: true }), (req, res) => {
+  const { out_trade_no, trade_status, trade_no } = req.body || {};
+  if (trade_status === 'TRADE_SUCCESS' || trade_status === 'TRADE_FINISHED') {
+    const db = loadDb();
+    const order = db.orders.find(o => o.id === out_trade_no);
+    if (order && order.status === 'pending') {
+      order.status = 'paid';
+      order.paidAt = new Date().toISOString();
+      order.externalId = trade_no || '';
+      const user = db.users.find(u => u.id === order.userId);
+      if (user && PLAN_PRICES[order.plan]) {
+        user.plan = order.plan;
+        console.log(`[Alipay] 用户 ${user.username} 升级到 ${order.plan}`);
+      }
+      saveDb(db);
+    }
+  }
+  res.send('success');
+});
+
+// --- 查询用户订单 ---
+app.get('/api/user/orders', requireAuth, (req, res) => {
+  const db = loadDb();
+  const mine = (db.orders || []).filter(o => o.userId === req.userId).sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+  res.json({ ok: true, orders: mine });
+});
+
+// --- 管理员: 查看所有订单 ---
+app.get('/api/admin/orders', requireAdmin, (req, res) => {
+  const db = loadDb();
+  const orders = (db.orders || []).sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+  const users = new Map(db.users.map(u => [u.id, u.username]));
+  res.json({ ok: true, orders: orders.map(o => ({ ...o, username: users.get(o.userId) || o.userId })) });
 });
 
 // --- 管理员: 全量使用统计 ---
@@ -1718,6 +2242,253 @@ app.post('/api/rag/search', requireAuth, async (req, res) => {
   res.json({ ok: true, results });
 });
 
+// --- 组织/团队管理 (多租户) ---
+app.get('/api/user/orgs', requireAuth, (req, res) => {
+  const db = loadDb();
+  const orgs = (db.orgs || []).filter(o => o.members.some(m => m.userId === req.userId));
+  const result = orgs.map(o => {
+    const member = o.members.find(m => m.userId === req.userId);
+    return { id: o.id, name: o.name, role: member?.role || 'member', memberCount: o.members.length, createdAt: o.createdAt };
+  });
+  res.json({ ok: true, orgs: result });
+});
+
+app.post('/api/user/orgs', requireAuth, (req, res) => {
+  const { name } = req.body || {};
+  if (!name || typeof name !== 'string' || name.trim().length < 2 || name.trim().length > 50) {
+    return res.status(400).json({ ok: false, error: '组织名称需 2-50 字符' });
+  }
+  const db = loadDb();
+  const user = db.users.find(u => u.id === req.userId);
+  if (!user || !['pro', 'enterprise', 'max'].includes(user.plan)) {
+    return res.status(403).json({ ok: false, error: '仅 Pro 及以上套餐可创建组织' });
+  }
+  const org = {
+    id: `org_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    name: name.trim(),
+    ownerId: req.userId,
+    members: [{ userId: req.userId, role: 'owner', joinedAt: new Date().toISOString() }],
+    createdAt: new Date().toISOString(),
+  };
+  db.orgs.push(org);
+  addLog(db, 'info', req.userId, '创建组织', `创建了组织「${org.name}」`);
+  saveDb(db);
+  res.json({ ok: true, org: { id: org.id, name: org.name, role: 'owner', memberCount: 1, createdAt: org.createdAt } });
+});
+
+app.get('/api/orgs/:orgId/members', requireAuth, (req, res) => {
+  const db = loadDb();
+  const org = (db.orgs || []).find(o => o.id === req.params.orgId);
+  if (!org) return res.status(404).json({ ok: false, error: '组织不存在' });
+  if (!org.members.some(m => m.userId === req.userId)) return res.status(403).json({ ok: false, error: '非组织成员' });
+  const members = org.members.map(m => {
+    const u = db.users.find(x => x.id === m.userId);
+    return { userId: m.userId, username: u?.username, name: u?.name, role: m.role, joinedAt: m.joinedAt };
+  });
+  res.json({ ok: true, members, orgName: org.name });
+});
+
+app.post('/api/orgs/:orgId/members', requireAuth, (req, res) => {
+  const { username } = req.body || {};
+  if (!username) return res.status(400).json({ ok: false, error: '请提供用户名' });
+  const db = loadDb();
+  const org = (db.orgs || []).find(o => o.id === req.params.orgId);
+  if (!org) return res.status(404).json({ ok: false, error: '组织不存在' });
+  const me = org.members.find(m => m.userId === req.userId);
+  if (!me || !['owner', 'admin'].includes(me.role)) return res.status(403).json({ ok: false, error: '无权添加成员' });
+  const target = db.users.find(u => u.username === username.trim());
+  if (!target) return res.status(404).json({ ok: false, error: '用户不存在' });
+  if (org.members.some(m => m.userId === target.id)) return res.status(400).json({ ok: false, error: '用户已是成员' });
+  org.members.push({ userId: target.id, role: 'member', joinedAt: new Date().toISOString() });
+  addLog(db, 'info', req.userId, '添加组织成员', `将 ${target.username} 加入组织「${org.name}」`);
+  saveDb(db);
+  res.json({ ok: true });
+});
+
+app.delete('/api/orgs/:orgId/members/:memberId', requireAuth, (req, res) => {
+  const db = loadDb();
+  const org = (db.orgs || []).find(o => o.id === req.params.orgId);
+  if (!org) return res.status(404).json({ ok: false, error: '组织不存在' });
+  const me = org.members.find(m => m.userId === req.userId);
+  if (!me || !['owner', 'admin'].includes(me.role)) return res.status(403).json({ ok: false, error: '无权移除成员' });
+  if (req.params.memberId === org.ownerId) return res.status(400).json({ ok: false, error: '不能移除组织所有者' });
+  const idx = org.members.findIndex(m => m.userId === req.params.memberId);
+  if (idx < 0) return res.status(404).json({ ok: false, error: '成员不存在' });
+  org.members.splice(idx, 1);
+  addLog(db, 'info', req.userId, '移除组织成员', `将成员从组织「${org.name}」中移除`);
+  saveDb(db);
+  res.json({ ok: true });
+});
+
+app.post('/api/orgs/:orgId/members/:memberId/role', requireAuth, (req, res) => {
+  const { role } = req.body || {};
+  if (!['admin', 'member'].includes(role)) return res.status(400).json({ ok: false, error: '角色无效' });
+  const db = loadDb();
+  const org = (db.orgs || []).find(o => o.id === req.params.orgId);
+  if (!org) return res.status(404).json({ ok: false, error: '组织不存在' });
+  const me = org.members.find(m => m.userId === req.userId);
+  if (!me || me.role !== 'owner') return res.status(403).json({ ok: false, error: '仅所有者可变更角色' });
+  const target = org.members.find(m => m.userId === req.params.memberId);
+  if (!target) return res.status(404).json({ ok: false, error: '成员不存在' });
+  target.role = role;
+  saveDb(db);
+  res.json({ ok: true });
+});
+
+app.get('/api/orgs/:orgId/rag/docs', requireAuth, (req, res) => {
+  const db = loadDb();
+  const org = (db.orgs || []).find(o => o.id === req.params.orgId);
+  if (!org) return res.status(404).json({ ok: false, error: '组织不存在' });
+  if (!org.members.some(m => m.userId === req.userId)) return res.status(403).json({ ok: false, error: '非组织成员' });
+  const docs = (db.ragDocs || []).filter(d => d.scope === 'org' && d.orgId === req.params.orgId);
+  res.json({ ok: true, docs, orgName: org.name });
+});
+
+app.post('/api/orgs/:orgId/rag/upload', requireAuth, ragUpload.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ ok: false, error: '缺少文件' });
+  const db = loadDb();
+  const org = (db.orgs || []).find(o => o.id === req.params.orgId);
+  if (!org) { try { fs.unlinkSync(req.file.path); } catch {} return res.status(404).json({ ok: false, error: '组织不存在' }); }
+  const me = org.members.find(m => m.userId === req.userId);
+  if (!me || !['owner', 'admin'].includes(me.role)) {
+    try { fs.unlinkSync(req.file.path); } catch {}
+    return res.status(403).json({ ok: false, error: '仅管理员可上传组织文档' });
+  }
+
+  const docId = `rag_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const filePath = req.file.path;
+  const originalName = Buffer.from(req.file.originalname, 'latin1').toString('utf8');
+  const text = await extractText(filePath);
+  if (!text || text.length < 20) return res.status(400).json({ ok: false, error: '无法从文件中提取有效文本' });
+  const chunks = chunkText(text);
+
+  try {
+    const embeddings = await getEmbeddings(chunks, db);
+    const vectorChunks = chunks.map((c, i) => ({ text: c, embedding: embeddings[i] }));
+    ragVectorStore.set(docId, vectorChunks);
+    try {
+      const cachePath = embeddingCachePath(docId, req.userId);
+      const serializable = vectorChunks.map(c => ({ text: c.text, embedding: Array.from(c.embedding) }));
+      fs.writeFileSync(cachePath, JSON.stringify(serializable), 'utf8');
+    } catch {}
+
+    const docMeta = { id: docId, userId: req.userId, orgId: req.params.orgId, scope: 'org', filename: req.file.filename, originalName, chunks: chunks.length, chars: text.length, createdAt: new Date().toISOString() };
+    db.ragDocs.push(docMeta);
+    addLog(db, 'info', req.userId, '组织RAG上传', `向组织「${org.name}」上传文档 ${originalName}`);
+    saveDb(db);
+    res.json({ ok: true, doc: docMeta });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: `Embedding 生成失败: ${e.message}` });
+  }
+});
+
+app.delete('/api/orgs/:orgId/rag/docs/:docId', requireAuth, (req, res) => {
+  const db = loadDb();
+  const org = (db.orgs || []).find(o => o.id === req.params.orgId);
+  if (!org) return res.status(404).json({ ok: false, error: '组织不存在' });
+  const me = org.members.find(m => m.userId === req.userId);
+  if (!me || !['owner', 'admin'].includes(me.role)) return res.status(403).json({ ok: false, error: '仅管理员可删除组织文档' });
+  const idx = db.ragDocs.findIndex(d => d.id === req.params.docId && d.orgId === req.params.orgId);
+  if (idx < 0) return res.status(404).json({ ok: false, error: '文档不存在' });
+  const doc = db.ragDocs[idx];
+  try { fs.unlinkSync(path.join(RAG_DIR, doc.userId, doc.filename)); } catch {}
+  ragVectorStore.delete(doc.id);
+  db.ragDocs.splice(idx, 1);
+  addLog(db, 'info', req.userId, '组织RAG删除', `从组织「${org.name}」删除文档 ${doc.originalName}`);
+  saveDb(db);
+  res.json({ ok: true });
+});
+
+// --- 工作流管理 ---
+app.get('/api/workflows', requireAuth, (req, res) => {
+  const db = loadDb();
+  const workflows = db.workflows || DEFAULT_WORKFLOWS;
+  res.json({ ok: true, workflows: workflows.filter(w => w.active !== false) });
+});
+
+app.get('/api/admin/workflows', requireAdmin, (req, res) => {
+  const db = loadDb();
+  res.json({ ok: true, workflows: db.workflows || DEFAULT_WORKFLOWS });
+});
+
+app.post('/api/admin/workflows', requireAdmin, (req, res) => {
+  const { name, steps } = req.body || {};
+  if (!name || !Array.isArray(steps) || steps.length === 0) {
+    return res.status(400).json({ ok: false, error: '工作流名称和步骤不能为空' });
+  }
+  for (const s of steps) {
+    if (!s.id || !s.role) return res.status(400).json({ ok: false, error: '每个步骤需要 id 和 role' });
+  }
+  const db = loadDb();
+  const wf = {
+    id: `wf_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    name, steps, builtin: false, active: true,
+    createdBy: req.userId, createdAt: new Date().toISOString(),
+  };
+  db.workflows.push(wf);
+  addLog(db, 'info', req.userId, '创建工作流', `创建自定义工作流「${name}」（${steps.length} 步）`);
+  saveDb(db);
+  res.json({ ok: true, workflow: wf });
+});
+
+app.put('/api/admin/workflows/:id', requireAdmin, (req, res) => {
+  const db = loadDb();
+  const wf = (db.workflows || []).find(w => w.id === req.params.id);
+  if (!wf) return res.status(404).json({ ok: false, error: '工作流不存在' });
+  if (wf.builtin) return res.status(400).json({ ok: false, error: '内置工作流不可编辑' });
+  const { name, steps, active } = req.body || {};
+  if (name) wf.name = name;
+  if (Array.isArray(steps) && steps.length > 0) wf.steps = steps;
+  if (typeof active === 'boolean') wf.active = active;
+  addLog(db, 'info', req.userId, '编辑工作流', `修改工作流「${wf.name}」`);
+  saveDb(db);
+  res.json({ ok: true, workflow: wf });
+});
+
+app.delete('/api/admin/workflows/:id', requireAdmin, (req, res) => {
+  const db = loadDb();
+  const idx = (db.workflows || []).findIndex(w => w.id === req.params.id);
+  if (idx < 0) return res.status(404).json({ ok: false, error: '工作流不存在' });
+  if (db.workflows[idx].builtin) return res.status(400).json({ ok: false, error: '内置工作流不可删除' });
+  const removed = db.workflows.splice(idx, 1)[0];
+  addLog(db, 'info', req.userId, '删除工作流', `删除工作流「${removed.name}」`);
+  saveDb(db);
+  res.json({ ok: true });
+});
+
+app.post('/api/workflow/execute', requireAuth, async (req, res) => {
+  const { workflowId, input, dispatch } = req.body || {};
+  if (!input) return res.status(400).json({ ok: false, error: '缺少输入' });
+  const db = loadDb();
+  const wf = (db.workflows || []).find(w => w.id === workflowId && w.active !== false);
+  if (!wf) return res.status(404).json({ ok: false, error: '工作流不存在或已禁用' });
+
+  const user = db.users.find(u => u.id === req.userId);
+  const plan = user?.plan || 'free';
+  if (plan === 'free' && wf.steps.length > 1) {
+    return res.status(403).json({ ok: false, error: 'Free 套餐仅支持单步工作流' });
+  }
+
+  const stepResults = {};
+  const stepDetails = [];
+  try {
+    for (const step of wf.steps) {
+      let prompt = (step.inputTemplate || '{input}').replace(/\{input\}/g, input);
+      for (const [key, val] of Object.entries(stepResults)) {
+        prompt = prompt.replace(new RegExp(`\\{${key}\\}`, 'g'), val);
+      }
+      const stepDispatch = dispatch?.[step.id] || dispatch?.default || dispatch || null;
+      const { text, inputTokens, outputTokens, apiModel } = await runDispatchLLM(prompt, step.systemPrompt || '', stepDispatch, db.keys);
+      stepResults[step.id] = text;
+      stepDetails.push({ stepId: step.id, role: step.role, text, inputTokens, outputTokens, model: apiModel });
+    }
+    const finalStep = wf.steps[wf.steps.length - 1];
+    res.json({ ok: true, result: stepResults[finalStep.id], steps: stepDetails, workflowName: wf.name });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: `工作流执行失败: ${e.message}`, steps: stepDetails });
+  }
+});
+
 // --- RBAC 权限查询 ---
 // --- 用户: 修改个人资料 ---
 app.post('/api/user/profile', requireAuth, (req, res) => {
@@ -1760,33 +2531,110 @@ app.get('/api/admin/rag-stats', requireAdmin, (req, res) => {
   res.json({ ok: true, stats: userStats, totalDocs: docs.length });
 });
 
-// --- M05: 短信告警（阿里云 SMS HTTP 接口） ---
+// --- SLA 仪表盘数据 ---
+app.get('/api/admin/sla', requireAdmin, (req, res) => {
+  const uptimeMs = Date.now() - SLA_START_TIME;
+  const uptimeHours = (uptimeMs / 3600000).toFixed(1);
+  const uptimeDays = (uptimeMs / 86400000).toFixed(2);
+
+  const rts = slaMetrics.responseTimes;
+  const aiRts = slaMetrics.aiResponseTimes;
+  const sorted = [...rts].sort((a, b) => a - b);
+  const aiSorted = [...aiRts].sort((a, b) => a - b);
+
+  const percentile = (arr, p) => arr.length === 0 ? 0 : arr[Math.floor(arr.length * p / 100)] || 0;
+  const avg = (arr) => arr.length === 0 ? 0 : Math.round(arr.reduce((s, v) => s + v, 0) / arr.length);
+
+  const availability = slaMetrics.totalRequests === 0 ? 100
+    : ((1 - slaMetrics.totalErrors / slaMetrics.totalRequests) * 100).toFixed(3);
+
+  const hourlyKeys = Object.keys(slaMetrics.hourlyUptime).sort().slice(-168);
+  const hourlyData = hourlyKeys.map(k => {
+    const h = slaMetrics.hourlyUptime[k];
+    const total = h.ok + h.err;
+    return { hour: k, requests: total, errors: h.err, availability: total === 0 ? 100 : ((h.ok / total) * 100).toFixed(2) };
+  });
+
+  res.json({
+    ok: true,
+    uptime: { ms: uptimeMs, hours: parseFloat(uptimeHours), days: parseFloat(uptimeDays), startedAt: new Date(SLA_START_TIME).toISOString() },
+    availability: parseFloat(availability),
+    totalRequests: slaMetrics.totalRequests,
+    totalErrors: slaMetrics.totalErrors,
+    responseTime: {
+      avg: avg(rts), p50: percentile(sorted, 50), p95: percentile(sorted, 95), p99: percentile(sorted, 99),
+      samples: rts.length,
+    },
+    aiResponseTime: {
+      avg: avg(aiRts), p50: percentile(aiSorted, 50), p95: percentile(aiSorted, 95), p99: percentile(aiSorted, 99),
+      samples: aiRts.length,
+    },
+    hourly: hourlyData,
+  });
+});
+
+// --- 短信告警（阿里云 SMS HTTP API + HMAC-SHA1 签名） ---
+function aliyunSign(params, accessSecret) {
+  const sorted = Object.keys(params).sort();
+  const canonicalized = sorted.map(k => `${encodeURIComponent(k)}=${encodeURIComponent(params[k])}`).join('&');
+  const stringToSign = `POST&${encodeURIComponent('/')}&${encodeURIComponent(canonicalized)}`;
+  const hmac = CryptoJS.HmacSHA1(stringToSign, accessSecret + '&');
+  return CryptoJS.enc.Base64.stringify(hmac);
+}
+
 async function sendSmsAlert(alertsConfig, title, content) {
   const phone = (alertsConfig.phone || '').trim();
-  const appKey = (alertsConfig.smsAppKey || '').trim();
+  const appKeyRaw = (alertsConfig.smsAppKey || '').trim();
   const provider = (alertsConfig.smsProvider || 'aliyun').trim();
-  if (!phone || !appKey) return [];
-  // 阿里云 SMS 签名方式 (简化 HTTP 调用)
+  const smsSign = (alertsConfig.smsSign || 'ZDF.AI').trim();
+  const smsTemplate = (alertsConfig.smsTemplate || '').trim();
+  if (!phone || !appKeyRaw) return [];
+
   if (provider === 'aliyun') {
+    // appKey 格式: "AccessKeyId:AccessKeySecret"
+    const parts = appKeyRaw.split(':');
+    if (parts.length < 2) {
+      return [{ channel: 'sms', ok: false, msg: 'AccessKey 格式应为 AccessKeyId:AccessKeySecret' }];
+    }
+    const [accessKeyId, accessSecret] = parts;
+    if (!smsTemplate) {
+      return [{ channel: 'sms', ok: false, msg: '请配置短信模板编号（如 SMS_123456）' }];
+    }
     try {
-      const params = new URLSearchParams({
-        AccessKeyId: appKey,
+      const params = {
+        AccessKeyId: accessKeyId,
         Action: 'SendSms',
-        PhoneNumbers: phone,
-        SignName: 'ZDF.AI',
-        TemplateCode: 'SMS_000000', // 需要用户配置实际模板
-        TemplateParam: JSON.stringify({ title: title.slice(0, 20), content: content.slice(0, 100) }),
         Format: 'JSON',
-        Version: '2017-05-25',
+        PhoneNumbers: phone,
+        RegionId: 'cn-hangzhou',
+        SignName: smsSign,
         SignatureMethod: 'HMAC-SHA1',
+        SignatureNonce: `${Date.now()}_${Math.random().toString(36).slice(2)}`,
+        SignatureVersion: '1.0',
+        TemplateCode: smsTemplate,
+        TemplateParam: JSON.stringify({ title: title.slice(0, 20), content: content.slice(0, 100) }),
         Timestamp: new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
-        SignatureNonce: Math.random().toString(36).slice(2),
+        Version: '2017-05-25',
+      };
+      params.Signature = aliyunSign(params, accessSecret);
+
+      const body = new URLSearchParams(params).toString();
+      const res = await fetch('https://dysmsapi.aliyuncs.com/', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body,
       });
-      // 注意：完整的阿里云签名需要 HMAC-SHA1，此处为示意。实际生产请用 @alicloud/dysmsapi SDK
-      console.log(`[SMS] 阿里云短信告警 -> ${phone}: ${title}`);
-      return [{ channel: 'sms', ok: true, msg: `短信已发送到 ${phone}（需配置阿里云签名和模板）` }];
+      const json = await res.json();
+      if (json.Code === 'OK') {
+        console.log(`[SMS] 阿里云短信发送成功 -> ${phone}`);
+        return [{ channel: 'sms', ok: true, msg: `短信已发送到 ${phone}` }];
+      } else {
+        console.warn(`[SMS] 阿里云返回错误:`, json);
+        return [{ channel: 'sms', ok: false, msg: `阿里云 SMS 错误: ${json.Code} - ${json.Message}` }];
+      }
     } catch (e) {
-      return [{ channel: 'sms', ok: false, msg: e.message }];
+      console.error('[SMS] 发送异常:', e.message);
+      return [{ channel: 'sms', ok: false, msg: `短信发送异常: ${e.message}` }];
     }
   }
   return [{ channel: 'sms', ok: false, msg: `不支持的 SMS 提供商: ${provider}` }];

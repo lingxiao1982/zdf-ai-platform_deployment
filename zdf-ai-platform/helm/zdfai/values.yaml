@@ -1,0 +1,43 @@
+replicaCount: 1
+
+image:
+  repository: zdfai/platform
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 3000
+
+ingress:
+  enabled: false
+  className: nginx
+  host: zdf.ai
+  tls: false
+  tlsSecretName: zdfai-tls
+
+env:
+  NODE_ENV: production
+  JWT_SECRET: change-me-in-production
+  STRIPE_SECRET_KEY: ""
+  STRIPE_WEBHOOK_SECRET: ""
+  OLLAMA_BASE_URL: "http://ollama:11434"
+
+persistence:
+  enabled: true
+  size: 10Gi
+  storageClass: ""
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+ollama:
+  enabled: false
+  image: ollama/ollama:latest
+  persistence:
+    size: 50Gi

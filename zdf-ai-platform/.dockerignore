@@ -1,0 +1,10 @@
+node_modules
+backend/node_modules
+backend/data
+dist
+.git
+*.md
+*.drawio
+*.svg
+*.zip
+*.docx
