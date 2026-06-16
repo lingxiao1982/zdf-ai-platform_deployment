@@ -597,6 +597,12 @@ function loadDb() {
       for (const dv of DEFAULT_VENDORS) {
         if (!existingIds.has(dv.id)) data.vendors.push(dv);
       }
+      // 迁移：修正无效的豆包模型名
+      const dbao = data.vendors.find(v => v.id === 'doubao');
+      if (dbao && dbao.models?.some(m => m.startsWith('doubao-seed-2.0'))) {
+        dbao.models = DEFAULT_VENDORS.find(v => v.id === 'doubao').models;
+        try { fs.writeFileSync(DATA_PATH, JSON.stringify(data, null, 2), 'utf8'); } catch {}
+      }
     }
     if (!data.usage || typeof data.usage !== 'object') data.usage = {};
     if (!Array.isArray(data.tokenLogs)) data.tokenLogs = [];
@@ -652,7 +658,7 @@ const DEFAULT_VENDORS = [
   { id: 'deepseek', name: 'DeepSeek (深度求索)', region: 'CN', models: ['deepseek-v4-pro', 'deepseek-v4-flash', 'deepseek-chat', 'deepseek-reasoner'] },
   { id: 'alibaba', name: 'Alibaba (阿里)', region: 'CN', models: ['qwen-max', 'qwen-plus', 'qwen-turbo', 'qwq-plus', 'qwen3-coder-plus'] },
   { id: 'zhipu', name: 'Zhipu (智谱)', region: 'CN', models: ['glm-5.1', 'glm-5', 'glm-4-plus', 'glm-4'] },
-  { id: 'doubao', name: 'Doubao (豆包)', region: 'CN', models: ['doubao-seed-2.0-pro', 'doubao-seed-2.0-lite', 'doubao-seed-2.0-code', 'doubao-pro-128k'] },
+  { id: 'doubao', name: 'Doubao (豆包)', region: 'CN', models: ['doubao-seed-1.6', 'doubao-seed-1.6-lite', 'doubao-seed-code', 'doubao-1.5-pro-32k', 'doubao-pro-128k'] },
   { id: 'moonshot', name: 'Moonshot (月之暗面)', region: 'CN', models: ['kimi-k2.6', 'kimi-k2.5', 'moonshot-v1-128k'] },
   { id: 'ollama', name: 'Ollama (本地)', region: 'LOCAL', models: ['llama3.3', 'qwen2.5', 'deepseek-r1', 'codellama', 'mistral', 'gemma2'] },
   { id: 'vllm', name: 'vLLM (本地)', region: 'LOCAL', models: ['自定义模型'] },
@@ -710,11 +716,14 @@ function resolveApiModel(vendor, model) {
     return 'gemini-2.5-flash';
   }
   if (vendor === 'doubao') {
-    if (/seed.*pro|2\.0.*pro/i.test(m)) return 'doubao-seed-2.0-pro';
-    if (/seed.*code|2\.0.*code/i.test(m)) return 'doubao-seed-2.0-code';
-    if (/seed.*lite|2\.0.*lite/i.test(m)) return 'doubao-seed-2.0-lite';
+    // 支持用户直接填写接入点 ID（ep-xxxxx）
+    if (/^ep-/i.test(m)) return m;
+    if (/seed-1\.6(?![-\w])/i.test(m)) return 'doubao-seed-1.6';
+    if (/seed.*1\.6.*lite|seed-1\.6-lite/i.test(m)) return 'doubao-seed-1.6-lite';
+    if (/seed.*code/i.test(m)) return 'doubao-seed-code';
+    if (/1\.5.*pro.*32k/i.test(m)) return 'doubao-1.5-pro-32k';
     if (/128k/i.test(m)) return 'doubao-pro-128k';
-    return 'doubao-seed-2.0-lite';
+    return m || 'doubao-seed-1.6';
   }
   // 本地模型（Ollama / vLLM / LocalAI）: 直接透传模型名
   if (['ollama', 'vllm', 'localai'].includes(vendor)) {
@@ -765,9 +774,10 @@ const MODEL_PRICING = {
   'glm-4-plus':  { input: 0.50, output: 0.50 },
   'glm-4':       { input: 0.15, output: 0.15 },
   // Doubao
-  'doubao-seed-2.0-pro':  { input: 0.40, output: 0.40 },
-  'doubao-seed-2.0-lite': { input: 0.08, output: 0.08 },
-  'doubao-seed-2.0-code': { input: 0.40, output: 0.40 },
+  'doubao-seed-1.6':      { input: 0.40, output: 0.40 },
+  'doubao-seed-1.6-lite': { input: 0.08, output: 0.08 },
+  'doubao-seed-code':     { input: 0.40, output: 0.40 },
+  'doubao-1.5-pro-32k':   { input: 0.40, output: 0.40 },
   'doubao-pro-128k':      { input: 0.70, output: 0.90 },
   // Moonshot
   'kimi-k2.6':          { input: 0.60, output: 0.60 },
@@ -821,7 +831,13 @@ async function chatOpenAICompatible(baseUrl, chatPath, apiKey, apiModel, systemP
     }),
   });
   const text = await res.text();
-  if (!res.ok) throw new Error(`OpenAI兼容接口 ${res.status}: ${text.slice(0, 400)}`);
+  if (!res.ok) {
+    let hint = '';
+    if (res.status === 401 && url.includes('volces.com')) {
+      hint = '\n提示: 豆包 API Key 需从「火山方舟控制台 → API Key 管理」获取，不是火山引擎 AccessKey(AKLT...)。';
+    }
+    throw new Error(`OpenAI兼容接口 ${res.status}: ${text.slice(0, 400)}${hint}`);
+  }
   const data = JSON.parse(text);
   const out = data.choices?.[0]?.message?.content;
   if (!out) throw new Error('OpenAI兼容接口无 choices 文本');
@@ -1606,12 +1622,18 @@ app.post('/api/user/history', (req, res) => {
 });
 
 /** 管理员「测试 Key」：真实探测各兼容接口 */
+const TEST_KEY_MODEL = {
+  openai: 'gpt-4.1-mini', anthropic: 'claude-haiku-4-5', google: 'gemini-2.5-flash',
+  deepseek: 'deepseek-chat', alibaba: 'qwen-turbo', zhipu: 'glm-4',
+  doubao: 'doubao-seed-1.6-lite', moonshot: 'moonshot-v1-128k',
+};
 app.post('/api/admin/test-key', requireAdmin, async (req, res) => {
   const vendorId = String(req.body?.vendorId || '').toLowerCase();
   const key = String(req.body?.key || '').trim();
   if (!vendorId || !key) return res.status(400).json({ ok: false, error: 'missing vendorId or key' });
 
-  const fakeDispatch = { vendor: vendorId, model: 'gpt-4o-mini', mode: 'platform', roleId: 'test' };
+  const testModel = TEST_KEY_MODEL[vendorId] || 'gpt-4.1-mini';
+  const fakeDispatch = { vendor: vendorId, model: testModel, mode: 'platform', roleId: 'test' };
   const keys = { [vendorId]: { value: key } };
 
   try {
