@@ -7,6 +7,7 @@ import express from 'express';
 import cors from 'cors';
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
@@ -28,12 +29,14 @@ const PORT = Number(process.env.PORT) || 3000;
 const DATA_PATH = path.join(__dirname, 'data', 'store.json');
 const DIST_PATH = path.join(__dirname, '..', 'dist');
 const RAG_DIR = path.join(__dirname, 'data', 'rag');
-const JWT_SECRET = process.env.JWT_SECRET || ('zdf_ai_' + Math.random().toString(36).slice(2) + Date.now().toString(36));
+const JWT_SECRET = process.env.JWT_SECRET || (() => {
+  const fallback = 'zdf_ai_' + crypto.randomBytes(32).toString('hex');
+  console.warn('[安全警告] 未设置 JWT_SECRET 环境变量，已生成临时随机密钥。');
+  console.warn('[安全警告] 生产环境请务必设置强密码: export JWT_SECRET="$(openssl rand -hex 32)"');
+  console.warn('[安全警告] 服务器重启后旧 token 将全部失效（因为临时密钥每次不同）');
+  return fallback;
+})();
 const BCRYPT_ROUNDS = 10;
-if (!process.env.JWT_SECRET) {
-  console.warn('[安全警告] 未设置 JWT_SECRET 环境变量，已生成随机密钥。生产环境请务必设置: export JWT_SECRET="你的强密码"');
-  console.warn('[安全警告] 服务器重启后旧 token 将全部失效（因为随机密钥每次不同）');
-}
 
 // --- Stripe 支付配置 ---
 const STRIPE_SECRET = process.env.STRIPE_SECRET_KEY || '';
@@ -41,13 +44,19 @@ const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
 const stripe = STRIPE_SECRET ? new Stripe(STRIPE_SECRET) : null;
 
 // RAG 文件上传配置
+function sanitizeRagFilename(originalName) {
+  const decoded = Buffer.from(originalName, 'latin1').toString('utf8');
+  const base = path.basename(decoded).replace(/[\\/:*?"<>|]/g, '_').replace(/\.{2,}/g, '_').slice(0, 200);
+  return `${Date.now()}_${base || 'upload'}`;
+}
+
 const ragStorage = multer.diskStorage({
   destination: (req, file, cb) => {
     const userDir = path.join(RAG_DIR, req.userId || 'unknown');
     fs.mkdirSync(userDir, { recursive: true });
     cb(null, userDir);
   },
-  filename: (req, file, cb) => cb(null, `${Date.now()}_${Buffer.from(file.originalname, 'latin1').toString('utf8')}`),
+  filename: (_req, file, cb) => cb(null, sanitizeRagFilename(file.originalname)),
 });
 const RAG_ALLOWED_EXTS = ['.txt', '.md', '.csv', '.json', '.log', '.pdf', '.docx'];
 const ragUpload = multer({
@@ -324,6 +333,30 @@ function acquireConcurrency(userId, limit) {
   });
 }
 
+/** 简易异步互斥锁：保证对 JSON 存储的写操作串行，防止并发丢失更新 */
+class AsyncLock {
+  constructor() { this.locked = false; this.waiters = []; }
+  acquire() {
+    return new Promise(resolve => {
+      if (!this.locked) {
+        this.locked = true;
+        resolve(() => this.release());
+      } else {
+        this.waiters.push(() => resolve(() => this.release()));
+      }
+    });
+  }
+  release() {
+    if (this.waiters.length > 0) {
+      const next = this.waiters.shift();
+      next();
+    } else {
+      this.locked = false;
+    }
+  }
+}
+const dbWriteLock = new AsyncLock();
+
 function releaseConcurrency(userId) {
   const current = concurrencyMap.get(userId) || 1;
   const q = concurrencyQueue.get(userId) || [];
@@ -404,6 +437,7 @@ function defaultDb() {
     ragDocs: [],      // [{ id, userId, filename, originalName, chunks, createdAt, scope?, orgId? }]
     workflows: DEFAULT_WORKFLOWS,
     orgs: [],            // [{ id, name, ownerId, members: [{ userId, role }], createdAt }]
+    oauthStates: [],     // [{ provider, state, expiresAt }] OAuth 防 CSRF 状态缓存
     upgradeRequests: [], // [{ id, userId, username, fromPlan, toPlan, message, status, createdAt, reviewedAt, reviewNote }]
     orders: [],          // [{ id, userId, plan, amount, currency, provider, status, createdAt, paidAt, externalId }]
   };
@@ -611,6 +645,7 @@ function loadDb() {
     if (!Array.isArray(data.ragDocs)) data.ragDocs = [];
     if (!Array.isArray(data.workflows) || data.workflows.length === 0) data.workflows = DEFAULT_WORKFLOWS;
     if (!Array.isArray(data.orgs)) data.orgs = [];
+    if (!Array.isArray(data.oauthStates)) data.oauthStates = [];
     if (!Array.isArray(data.upgradeRequests)) data.upgradeRequests = [];
     if (!Array.isArray(data.orders)) data.orders = [];
     // 迁移：将明文密码自动 hash（兼容旧 store.json）
@@ -1005,6 +1040,9 @@ app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false 
 const ALLOWED_ORIGINS = process.env.CORS_ORIGINS
   ? process.env.CORS_ORIGINS.split(',').map(s => s.trim())
   : null; // null = 开发模式允许全部
+if (process.env.NODE_ENV === 'production' && !ALLOWED_ORIGINS) {
+  console.warn('[安全警告] 生产环境未设置 CORS_ORIGINS，当前允许任意来源跨域访问。建议设置: CORS_ORIGINS=https://zdfai.site');
+}
 app.use(cors({
   origin: ALLOWED_ORIGINS
     ? (origin, cb) => (!origin || ALLOWED_ORIGINS.includes(origin) ? cb(null, true) : cb(new Error('CORS blocked')))
@@ -1399,7 +1437,7 @@ app.post('/api/auth/forgot-password', authLimiter, async (req, res) => {
   if (!user) {
     return res.json({ ok: true, msg: '如果该邮箱已注册，将收到重置邮件' });
   }
-  const resetToken = Math.random().toString(36).slice(2) + Date.now().toString(36) + Math.random().toString(36).slice(2);
+  const resetToken = crypto.randomBytes(32).toString('hex');
   if (!db.resetTokens) db.resetTokens = [];
   db.resetTokens = db.resetTokens.filter(t => t.userId !== user.id);
   db.resetTokens.push({ token: resetToken, userId: user.id, expiresAt: Date.now() + 3600_000 });
@@ -1441,7 +1479,9 @@ app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
   if (!user) return res.status(400).json({ ok: false, error: '邮箱未注册' });
   const tokenRow = (db.resetTokens || []).find(t => t.userId === user.id && t.expiresAt > Date.now());
   if (!tokenRow) return res.status(400).json({ ok: false, error: '验证码无效或已过期' });
-  if (!tokenRow.token.toUpperCase().startsWith(code.toUpperCase().trim())) {
+  const expected = tokenRow.token.slice(0, 8).toUpperCase();
+  const provided = code.toUpperCase().trim();
+  if (provided.length !== 8 || expected !== provided) {
     return res.status(400).json({ ok: false, error: '验证码错误' });
   }
   user.password = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
@@ -1456,15 +1496,21 @@ app.get('/api/auth/github', (req, res) => {
   const db = loadDb();
   const cfg = db.settings?.oauthConfig?.github || {};
   if (!cfg.clientId) return res.status(400).json({ ok: false, error: 'GitHub OAuth 未配置' });
-  const state = Math.random().toString(36).slice(2);
+  const state = crypto.randomBytes(16).toString('hex');
+  db.oauthStates = (db.oauthStates || []).filter(s => s.provider !== 'github' || s.expiresAt > Date.now());
+  db.oauthStates.push({ provider: 'github', state, expiresAt: Date.now() + 600_000 });
+  saveDb(db);
   const redirectUri = `${req.protocol}://${req.get('host')}/api/auth/github/callback`;
   res.json({ ok: true, url: `https://github.com/login/oauth/authorize?client_id=${encodeURIComponent(cfg.clientId)}&redirect_uri=${encodeURIComponent(redirectUri)}&state=${state}&scope=user:email` });
 });
 
 app.get('/api/auth/github/callback', async (req, res) => {
-  const { code } = req.query;
+  const { code, state } = req.query;
   if (!code) return res.status(400).send('Missing code');
   const db = loadDb();
+  const stateIdx = (db.oauthStates || []).findIndex(s => s.provider === 'github' && s.state === state && s.expiresAt > Date.now());
+  if (stateIdx < 0) return res.status(400).send('Invalid or expired OAuth state');
+  db.oauthStates.splice(stateIdx, 1);
   const cfg = db.settings?.oauthConfig?.github || {};
   if (!cfg.clientId || !cfg.clientSecret) return res.status(400).send('GitHub OAuth not configured');
   try {
@@ -1519,14 +1565,20 @@ app.get('/api/auth/google', (req, res) => {
   const cfg = db.settings?.oauthConfig?.google || {};
   if (!cfg.clientId) return res.status(400).json({ ok: false, error: 'Google OAuth 未配置' });
   const redirectUri = `${req.protocol}://${req.get('host')}/api/auth/google/callback`;
-  const state = Math.random().toString(36).slice(2);
+  const state = crypto.randomBytes(16).toString('hex');
+  db.oauthStates = (db.oauthStates || []).filter(s => s.provider !== 'google' || s.expiresAt > Date.now());
+  db.oauthStates.push({ provider: 'google', state, expiresAt: Date.now() + 600_000 });
+  saveDb(db);
   res.json({ ok: true, url: `https://accounts.google.com/o/oauth2/v2/auth?client_id=${encodeURIComponent(cfg.clientId)}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=openid%20email%20profile&state=${state}` });
 });
 
 app.get('/api/auth/google/callback', async (req, res) => {
-  const { code } = req.query;
+  const { code, state } = req.query;
   if (!code) return res.status(400).send('Missing code');
   const db = loadDb();
+  const stateIdx = (db.oauthStates || []).findIndex(s => s.provider === 'google' && s.state === state && s.expiresAt > Date.now());
+  if (stateIdx < 0) return res.status(400).send('Invalid or expired OAuth state');
+  db.oauthStates.splice(stateIdx, 1);
   const cfg = db.settings?.oauthConfig?.google || {};
   if (!cfg.clientId || !cfg.clientSecret) return res.status(400).send('Google OAuth not configured');
   try {
@@ -1689,7 +1741,7 @@ app.post('/api/ai/generate', generateLimiter, async (req, res) => {
 
   // --- 0. Free 用户模型白名单检查 ---
   if (plan === 'free' && dispatch?.vendor) {
-    const FREE_ALLOWED = { deepseek: true, alibaba: true, openai: ['gpt-4.1-mini', 'gpt-4o-mini'] };
+    const FREE_ALLOWED = { deepseek: true, alibaba: true, openai: ['gpt-4.1-mini'] };
     const v = dispatch.vendor.toLowerCase();
     const allowed = FREE_ALLOWED[v];
     if (!allowed) {
@@ -1729,50 +1781,55 @@ app.post('/api/ai/generate', generateLimiter, async (req, res) => {
     slaMetrics.aiResponseTimes.push(Date.now() - aiStartTime);
     if (slaMetrics.aiResponseTimes.length > SLA_MAX_AI_RT) slaMetrics.aiResponseTimes.shift();
 
-    // --- 4. 记录使用量 ---
+    // --- 4. 记录使用量（加写锁，防止并发请求覆盖用量数据） ---
     if (userId) {
-      const dbAfter = loadDb();
-      if (!dbAfter.usage[userId]) dbAfter.usage[userId] = {};
-      if (!dbAfter.usage[userId][today]) dbAfter.usage[userId][today] = { tasks: 0, credits: 0, tokens: { input: 0, output: 0 }, cost: 0 };
-      const dayUsage = dbAfter.usage[userId][today];
-      dayUsage.tasks += 1;
-      dayUsage.credits += creditCost;
-      dayUsage.tokens.input += (inputTokens || 0);
-      dayUsage.tokens.output += (outputTokens || 0);
-      const cost = calcCost(apiModel || dispatch?.model, inputTokens || 0, outputTokens || 0);
-      dayUsage.cost += cost;
+      const release = await dbWriteLock.acquire();
+      try {
+        const dbAfter = loadDb();
+        if (!dbAfter.usage[userId]) dbAfter.usage[userId] = {};
+        if (!dbAfter.usage[userId][today]) dbAfter.usage[userId][today] = { tasks: 0, credits: 0, tokens: { input: 0, output: 0 }, cost: 0 };
+        const dayUsage = dbAfter.usage[userId][today];
+        dayUsage.tasks += 1;
+        dayUsage.credits += creditCost;
+        dayUsage.tokens.input += (inputTokens || 0);
+        dayUsage.tokens.output += (outputTokens || 0);
+        const cost = calcCost(apiModel || dispatch?.model, inputTokens || 0, outputTokens || 0);
+        dayUsage.cost += cost;
 
-      // 记录 token 日志
-      dbAfter.tokenLogs.push({
-        ts: new Date().toISOString(),
-        userId,
-        vendor: dispatch?.vendor,
-        model: apiModel || dispatch?.model,
-        roleId: dispatch?.roleId,
-        inputTokens: inputTokens || 0,
-        outputTokens: outputTokens || 0,
-        cost: Math.round(cost * 1_000_000) / 1_000_000,
-        stub,
-      });
-      // 只保留最近 5000 条 token 日志
-      if (dbAfter.tokenLogs.length > 5000) dbAfter.tokenLogs = dbAfter.tokenLogs.slice(-5000);
+        // 记录 token 日志
+        dbAfter.tokenLogs.push({
+          ts: new Date().toISOString(),
+          userId,
+          vendor: dispatch?.vendor,
+          model: apiModel || dispatch?.model,
+          roleId: dispatch?.roleId,
+          inputTokens: inputTokens || 0,
+          outputTokens: outputTokens || 0,
+          cost: Math.round(cost * 1_000_000) / 1_000_000,
+          stub,
+        });
+        // 只保留最近 5000 条 token 日志
+        if (dbAfter.tokenLogs.length > 5000) dbAfter.tokenLogs = dbAfter.tokenLogs.slice(-5000);
 
-      // --- 超额预警：自动触发告警 ---
-      if (limits.dailyTasks > 0 && user) {
-        const pct = dayUsage.tasks / limits.dailyTasks;
-        const prevPct = (dayUsage.tasks - 1) / limits.dailyTasks;
-        if (pct >= 1 && prevPct < 1) {
-          const cfg = dbAfter.settings?.alertsConfig || defaultAlerts();
-          const msg = `用户 ${user.username}（${plan}）达到每日上限 ${limits.dailyTasks} 次`;
-          sendWebhookAlert(cfg, '超额预警：用户达到上限', msg).catch(() => {});
-          sendEmailAlert(cfg, '超额预警：用户达到上限', msg).catch(() => {});
-          addLog(dbAfter, 'warn', user.username, '超额预警', msg);
-        } else if (pct >= 0.8 && prevPct < 0.8) {
-          addLog(dbAfter, 'warn', user.username, '用量预警', `用户已使用 ${Math.round(pct * 100)}% 每日任务额度（${dayUsage.tasks}/${limits.dailyTasks}）`);
+        // --- 超额预警：自动触发告警 ---
+        if (limits.dailyTasks > 0 && user) {
+          const pct = dayUsage.tasks / limits.dailyTasks;
+          const prevPct = (dayUsage.tasks - 1) / limits.dailyTasks;
+          if (pct >= 1 && prevPct < 1) {
+            const cfg = dbAfter.settings?.alertsConfig || defaultAlerts();
+            const msg = `用户 ${user.username}（${plan}）达到每日上限 ${limits.dailyTasks} 次`;
+            sendWebhookAlert(cfg, '超额预警：用户达到上限', msg).catch(() => {});
+            sendEmailAlert(cfg, '超额预警：用户达到上限', msg).catch(() => {});
+            addLog(dbAfter, 'warn', user.username, '超额预警', msg);
+          } else if (pct >= 0.8 && prevPct < 0.8) {
+            addLog(dbAfter, 'warn', user.username, '用量预警', `用户已使用 ${Math.round(pct * 100)}% 每日任务额度（${dayUsage.tasks}/${limits.dailyTasks}）`);
+          }
         }
-      }
 
-      saveDb(dbAfter);
+        saveDb(dbAfter);
+      } finally {
+        release();
+      }
     }
 
     const usageWarning = (userId && limits.dailyTasks > 0) ? (() => {
@@ -2168,8 +2225,9 @@ app.get('/api/user/can-export', requireAuth, (req, res) => {
 // --- 用户 API Key 管理 (Pro+) ---
 function generateApiKey() {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  const bytes = crypto.randomBytes(32);
   let key = 'zdf_ak_';
-  for (let i = 0; i < 32; i++) key += chars[Math.floor(Math.random() * chars.length)];
+  for (let i = 0; i < 32; i++) key += chars[bytes[i] % chars.length];
   return key;
 }
 
@@ -2657,7 +2715,7 @@ async function sendSmsAlert(alertsConfig, title, content) {
         RegionId: 'cn-hangzhou',
         SignName: smsSign,
         SignatureMethod: 'HMAC-SHA1',
-        SignatureNonce: `${Date.now()}_${Math.random().toString(36).slice(2)}`,
+        SignatureNonce: `${Date.now()}_${crypto.randomBytes(8).toString('hex')}`,
         SignatureVersion: '1.0',
         TemplateCode: smsTemplate,
         TemplateParam: JSON.stringify({ title: title.slice(0, 20), content: content.slice(0, 100) }),
