@@ -1,7 +1,12 @@
 #!/bin/bash
-# ZDF.AI 腾讯云部署脚本
+# ZDF.AI 腾讯云部署脚本 — dedicated domain zdfai.site only.
 # 用法：在服务器上执行 bash deploy.sh
 # 首次部署约需 5 分钟
+#
+# Do NOT run this on the shared zdfai.cn host. It takes over nginx for
+# zdfai.site, uses APP_DIR=/var/www/zdfai, PM2 name zdf-ai-platform, and
+# PORT 3000. For https://zdfai.cn/BestAnswer/ use nginx-bestanswer.conf
+# plus ecosystem.bestanswer.config.cjs with BASE_PATH=/BestAnswer.
 
 set -euo pipefail
 
@@ -52,15 +57,18 @@ fi
 pm2 save
 
 # 仅在 systemd 可用且未配置时执行 PM2 自启脚本
+# ${USER:-} / ${HOME:-} so `set -u` does not abort when USER is unset
+PM2_USER="${USER:-$(id -un 2>/dev/null || echo root)}"
+PM2_HOME="${HOME:-/root}"
 if command -v systemctl &> /dev/null; then
-    if ! systemctl is-enabled "pm2-${USER}" >/dev/null 2>&1; then
+    if ! systemctl is-enabled "pm2-${PM2_USER}" >/dev/null 2>&1; then
         echo "=== 配置 PM2 开机自启 ==="
         # 输出命令经校验后执行，避免直接 pipe 任意内容到 bash
-        STARTUP_CMD=$(pm2 startup systemd -u "${USER}" --hp "${HOME}" 2>/dev/null | tail -n 1 || true)
+        STARTUP_CMD=$(pm2 startup systemd -u "${PM2_USER}" --hp "${PM2_HOME}" 2>/dev/null | tail -n 1 || true)
         if [[ -n "$STARTUP_CMD" && "$STARTUP_CMD" == *"pm2 startup"* ]]; then
             bash -c "$STARTUP_CMD" || echo "[警告] PM2 开机自启配置失败，请手动执行: $STARTUP_CMD"
         else
-            echo "[警告] 无法自动生成 PM2 自启命令，请手动运行: pm2 startup systemd -u ${USER} --hp ${HOME}"
+            echo "[警告] 无法自动生成 PM2 自启命令，请手动运行: pm2 startup systemd -u ${PM2_USER} --hp ${PM2_HOME}"
         fi
     else
         echo "PM2 开机自启已配置，跳过"
@@ -72,8 +80,13 @@ echo "=== 配置 Nginx ==="
 cp "$APP_DIR/nginx.conf" "/etc/nginx/sites-available/$DOMAIN"
 ln -sf "/etc/nginx/sites-available/$DOMAIN" "/etc/nginx/sites-enabled/$DOMAIN"
 rm -f /etc/nginx/sites-enabled/default
-nginx -t || error_exit "Nginx 配置校验失败"
-systemctl reload nginx || error_exit "Nginx 重载失败"
+# First-time TLS: nginx.conf references cert files that may not exist yet.
+# Do not abort the whole deploy before certbot can run.
+if nginx -t; then
+    systemctl reload nginx || echo "[警告] Nginx 重载失败"
+else
+    echo "[警告] Nginx 配置校验失败（常见于首次部署、证书尚未申请），继续申请证书"
+fi
 
 echo ""
 echo "=== 申请 SSL 证书（Let's Encrypt） ==="

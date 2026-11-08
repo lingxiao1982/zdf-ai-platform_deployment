@@ -1,5 +1,8 @@
-import { describe, it, before } from 'node:test';
+import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
 const BASE = 'http://localhost:3000/api';
 let adminToken = '';
@@ -160,6 +163,98 @@ describe('ZDF.AI Backend API Tests', { concurrency: false }, () => {
         method: 'POST', token: userToken, body: { oldPassword: 'wrongpw', newPassword: 'newpass123' },
       });
       assert.ok(status >= 400);
+    });
+  });
+
+  describe('Password reset code matching', () => {
+    const STORE = path.join(path.dirname(fileURLToPath(import.meta.url)), 'data', 'store.json');
+    const email = `reset_${Date.now()}@example.com`;
+    let resetUserPass = 'test1234';
+
+    it('rejects a 1-character prefix and accepts the exact 8-character code', async () => {
+      const username = `resetuser_${Date.now()}`;
+      const reg = await api('/auth/register', {
+        method: 'POST',
+        body: { username, password: resetUserPass, name: 'Reset User', email },
+      });
+      assert.equal(reg.status, 200);
+
+      const forgot = await api('/auth/forgot-password', { method: 'POST', body: { email } });
+      assert.equal(forgot.status, 200);
+
+      const db = JSON.parse(fs.readFileSync(STORE, 'utf8'));
+      const user = db.users.find(u => u.email === email);
+      assert.ok(user);
+      const row = (db.resetTokens || []).find(t => t.userId === user.id);
+      assert.ok(row && row.token, 'reset token should be persisted');
+
+      const prefix1 = await api('/auth/reset-password', {
+        method: 'POST',
+        body: { email, code: row.token.slice(0, 1), newPassword: 'newpass123' },
+      });
+      assert.equal(prefix1.status, 400, '1-character prefix must not reset the password');
+
+      const exact = await api('/auth/reset-password', {
+        method: 'POST',
+        body: { email, code: row.token.slice(0, 8), newPassword: 'newpass123' },
+      });
+      assert.equal(exact.status, 200);
+    });
+  });
+
+  describe('OAuth github initiate (no store write, cookie-bound state)', () => {
+    const STORE = path.join(path.dirname(fileURLToPath(import.meta.url)), 'data', 'store.json');
+
+    it('does not persist oauthStates when starting GitHub OAuth', async () => {
+      const cfg = await api('/admin/oauth-config', {
+        method: 'POST',
+        token: adminToken,
+        body: { github: { clientId: 'test_github_client_id' } },
+      });
+      assert.equal(cfg.status, 200);
+
+      const before = JSON.parse(fs.readFileSync(STORE, 'utf8'));
+      const beforeStates = JSON.stringify(before.oauthStates || []);
+      const beforeSize = fs.statSync(STORE).size;
+
+      const res = await fetch(`${BASE}/auth/github`);
+      const data = await res.json();
+      assert.equal(res.status, 200);
+      assert.ok(data.url && data.url.includes('state='));
+
+      const setCookie = typeof res.headers.getSetCookie === 'function'
+        ? res.headers.getSetCookie()
+        : [res.headers.get('set-cookie')].filter(Boolean);
+      assert.ok(setCookie.some(c => String(c).includes('oauth_state_github=')), `expected oauth_state_github cookie, got ${JSON.stringify(setCookie)}`);
+
+      const after = JSON.parse(fs.readFileSync(STORE, 'utf8'));
+      assert.equal(JSON.stringify(after.oauthStates || []), beforeStates);
+      assert.equal(fs.statSync(STORE).size, beforeSize);
+    });
+
+    it('rejects callback when the state cookie is missing or does not match', async () => {
+      const start = await fetch(`${BASE}/auth/github`);
+      assert.equal(start.status, 200);
+      const body = await start.json();
+      const state = new URL(body.url).searchParams.get('state');
+      assert.ok(state);
+
+      const setCookie = typeof start.headers.getSetCookie === 'function'
+        ? start.headers.getSetCookie()
+        : [start.headers.get('set-cookie')].filter(Boolean);
+      const cookieHeader = setCookie.map(c => String(c).split(';')[0]).join('; ');
+
+      const noCookie = await fetch(`${BASE}/auth/github/callback?code=dummy&state=${encodeURIComponent(state)}`);
+      const noCookieText = await noCookie.text();
+      assert.equal(noCookie.status, 400);
+      assert.match(noCookieText, /Invalid or expired OAuth state/);
+
+      const mismatch = await fetch(`${BASE}/auth/github/callback?code=dummy&state=not-the-cookie`, {
+        headers: { Cookie: cookieHeader },
+      });
+      const mismatchText = await mismatch.text();
+      assert.equal(mismatch.status, 400);
+      assert.match(mismatchText, /Invalid or expired OAuth state/);
     });
   });
 });

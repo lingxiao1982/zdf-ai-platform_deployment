@@ -65,7 +65,7 @@ const PLAN_LIMITS = {
 const CREDIT_COSTS = { single: 1, pipeline: 5, rag: 10, deepReasoning: 20 };
 const PIPELINE_CREDITS = 5;  // 四模型协同流水线总消耗（前端 UI 展示用）
 
-const API_BASE_URL = "/api"; // 部署前务必使用相对路径，让 Nginx 代理到后端 3000
+const API_BASE_URL = `${(import.meta.env.BASE_URL || '/').replace(/\/$/, '')}/api`;
 
 const stripMarkdown = (text) => {
   if (!text) return text;

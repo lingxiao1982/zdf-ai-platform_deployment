@@ -10,7 +10,7 @@ WORKDIR /app
 COPY --from=builder /app/dist ./dist
 COPY backend/package.json backend/package-lock.json ./backend/
 RUN cd backend && npm ci --omit=dev
-COPY backend/server.js ./backend/
+COPY backend/server.js backend/security-utils.js ./backend/
 RUN mkdir -p backend/data backend/data/rag
 
 ENV NODE_ENV=production

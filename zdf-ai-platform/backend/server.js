@@ -21,6 +21,17 @@ import mammoth from 'mammoth';
 import PDFDocument from 'pdfkit';
 import Stripe from 'stripe';
 import CryptoJS from 'crypto-js';
+import {
+  sanitizeRagFilename,
+  RAG_ALLOWED_EXTS,
+  randomPassword,
+  generateOAuthState,
+  oauthStateCookieName,
+  oauthStateCookieOptions,
+  resetCodeMatches,
+  normalizePublicBase,
+  timingSafeEqualStr,
+} from './security-utils.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -29,6 +40,7 @@ const PORT = Number(process.env.PORT) || 3000;
 const DATA_PATH = path.join(__dirname, 'data', 'store.json');
 const DIST_PATH = path.join(__dirname, '..', 'dist');
 const RAG_DIR = path.join(__dirname, 'data', 'rag');
+const PUBLIC_BASE = normalizePublicBase(process.env.BASE_PATH);
 const JWT_SECRET = process.env.JWT_SECRET || (() => {
   const fallback = 'zdf_ai_' + crypto.randomBytes(32).toString('hex');
   console.warn('[安全警告] 未设置 JWT_SECRET 环境变量，已生成临时随机密钥。');
@@ -44,12 +56,6 @@ const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
 const stripe = STRIPE_SECRET ? new Stripe(STRIPE_SECRET) : null;
 
 // RAG 文件上传配置
-function sanitizeRagFilename(originalName) {
-  const decoded = Buffer.from(originalName, 'latin1').toString('utf8');
-  const base = path.basename(decoded).replace(/[\\/:*?"<>|]/g, '_').replace(/\.{2,}/g, '_').slice(0, 200);
-  return `${Date.now()}_${base || 'upload'}`;
-}
-
 const ragStorage = multer.diskStorage({
   destination: (req, file, cb) => {
     const userDir = path.join(RAG_DIR, req.userId || 'unknown');
@@ -58,7 +64,6 @@ const ragStorage = multer.diskStorage({
   },
   filename: (_req, file, cb) => cb(null, sanitizeRagFilename(file.originalname)),
 });
-const RAG_ALLOWED_EXTS = ['.txt', '.md', '.csv', '.json', '.log', '.pdf', '.docx'];
 const ragUpload = multer({
   storage: ragStorage,
   limits: { fileSize: 20 * 1024 * 1024 },
@@ -102,6 +107,34 @@ function parseCookies(req) {
     if (k) obj[k.trim()] = decodeURIComponent(v.join('='));
   });
   return obj;
+}
+
+function oauthCookiePath() {
+  return PUBLIC_BASE || '/';
+}
+
+function beginOAuthState(res, provider) {
+  const state = generateOAuthState();
+  res.cookie(
+    oauthStateCookieName(provider),
+    state,
+    oauthStateCookieOptions({
+      secure: process.env.NODE_ENV === 'production',
+      path: oauthCookiePath(),
+    }),
+  );
+  return state;
+}
+
+function consumeOAuthState(req, res, provider, state) {
+  const cookies = parseCookies(req);
+  const expected = cookies[oauthStateCookieName(provider)] || '';
+  res.clearCookie(oauthStateCookieName(provider), {
+    httpOnly: true,
+    sameSite: 'lax',
+    path: oauthCookiePath(),
+  });
+  return !!(state && expected && timingSafeEqualStr(expected, String(state)));
 }
 
 /** Express 中间件：解析并注入 req.userId, req.userRole */
@@ -333,30 +366,6 @@ function acquireConcurrency(userId, limit) {
   });
 }
 
-/** 简易异步互斥锁：保证对 JSON 存储的写操作串行，防止并发丢失更新 */
-class AsyncLock {
-  constructor() { this.locked = false; this.waiters = []; }
-  acquire() {
-    return new Promise(resolve => {
-      if (!this.locked) {
-        this.locked = true;
-        resolve(() => this.release());
-      } else {
-        this.waiters.push(() => resolve(() => this.release()));
-      }
-    });
-  }
-  release() {
-    if (this.waiters.length > 0) {
-      const next = this.waiters.shift();
-      next();
-    } else {
-      this.locked = false;
-    }
-  }
-}
-const dbWriteLock = new AsyncLock();
-
 function releaseConcurrency(userId) {
   const current = concurrencyMap.get(userId) || 1;
   const q = concurrencyQueue.get(userId) || [];
@@ -437,7 +446,7 @@ function defaultDb() {
     ragDocs: [],      // [{ id, userId, filename, originalName, chunks, createdAt, scope?, orgId? }]
     workflows: DEFAULT_WORKFLOWS,
     orgs: [],            // [{ id, name, ownerId, members: [{ userId, role }], createdAt }]
-    oauthStates: [],     // [{ provider, state, expiresAt }] OAuth 防 CSRF 状态缓存
+    oauthStates: [],     // leftover field; OAuth CSRF state is cookie-bound, not stored here
     upgradeRequests: [], // [{ id, userId, username, fromPlan, toPlan, message, status, createdAt, reviewedAt, reviewNote }]
     orders: [],          // [{ id, userId, plan, amount, currency, provider, status, createdAt, paidAt, externalId }]
   };
@@ -1050,6 +1059,18 @@ app.use(cors({
   credentials: true,
 }));
 
+if (PUBLIC_BASE) {
+  app.use((req, _res, next) => {
+    const raw = req.url || '';
+    if (raw === PUBLIC_BASE || raw.startsWith(`${PUBLIC_BASE}/`) || raw.startsWith(`${PUBLIC_BASE}?`)) {
+      let rest = raw.slice(PUBLIC_BASE.length);
+      if (!rest || rest.startsWith('?')) rest = `/${rest}`;
+      req.url = rest;
+    }
+    next();
+  });
+}
+
 // SLA 响应时间追踪中间件
 app.use((req, res, next) => {
   if (!req.path.startsWith('/api/')) return next();
@@ -1479,9 +1500,7 @@ app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
   if (!user) return res.status(400).json({ ok: false, error: '邮箱未注册' });
   const tokenRow = (db.resetTokens || []).find(t => t.userId === user.id && t.expiresAt > Date.now());
   if (!tokenRow) return res.status(400).json({ ok: false, error: '验证码无效或已过期' });
-  const expected = tokenRow.token.slice(0, 8).toUpperCase();
-  const provided = code.toUpperCase().trim();
-  if (provided.length !== 8 || expected !== provided) {
+  if (!resetCodeMatches(tokenRow.token, code)) {
     return res.status(400).json({ ok: false, error: '验证码错误' });
   }
   user.password = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
@@ -1491,26 +1510,27 @@ app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
   res.json({ ok: true });
 });
 
+function publicOrigin(req) {
+  return `${req.protocol}://${req.get('host')}${PUBLIC_BASE}`;
+}
+
 // --- OAuth: GitHub 登录 ---
 app.get('/api/auth/github', (req, res) => {
   const db = loadDb();
   const cfg = db.settings?.oauthConfig?.github || {};
   if (!cfg.clientId) return res.status(400).json({ ok: false, error: 'GitHub OAuth 未配置' });
-  const state = crypto.randomBytes(16).toString('hex');
-  db.oauthStates = (db.oauthStates || []).filter(s => s.provider !== 'github' || s.expiresAt > Date.now());
-  db.oauthStates.push({ provider: 'github', state, expiresAt: Date.now() + 600_000 });
-  saveDb(db);
-  const redirectUri = `${req.protocol}://${req.get('host')}/api/auth/github/callback`;
+  const state = beginOAuthState(res, 'github');
+  const redirectUri = `${publicOrigin(req)}/api/auth/github/callback`;
   res.json({ ok: true, url: `https://github.com/login/oauth/authorize?client_id=${encodeURIComponent(cfg.clientId)}&redirect_uri=${encodeURIComponent(redirectUri)}&state=${state}&scope=user:email` });
 });
 
 app.get('/api/auth/github/callback', async (req, res) => {
   const { code, state } = req.query;
   if (!code) return res.status(400).send('Missing code');
+  if (!consumeOAuthState(req, res, 'github', state)) {
+    return res.status(400).send('Invalid or expired OAuth state');
+  }
   const db = loadDb();
-  const stateIdx = (db.oauthStates || []).findIndex(s => s.provider === 'github' && s.state === state && s.expiresAt > Date.now());
-  if (stateIdx < 0) return res.status(400).send('Invalid or expired OAuth state');
-  db.oauthStates.splice(stateIdx, 1);
   const cfg = db.settings?.oauthConfig?.github || {};
   if (!cfg.clientId || !cfg.clientSecret) return res.status(400).send('GitHub OAuth not configured');
   try {
@@ -1536,7 +1556,7 @@ app.get('/api/auth/github/callback', async (req, res) => {
       user = {
         id: `usr_gh_${ghUser.id}`,
         username: ghUser.login || `gh_${ghUser.id}`,
-        password: await bcrypt.hash(Math.random().toString(36).slice(2) + Date.now(), BCRYPT_ROUNDS),
+        password: await bcrypt.hash(randomPassword(), BCRYPT_ROUNDS),
         email: primaryEmail,
         role: 'user', roleDetail: 'user',
         name: ghUser.name || ghUser.login,
@@ -1553,7 +1573,7 @@ app.get('/api/auth/github/callback', async (req, res) => {
     }
     saveDb(db);
     const jwtToken = jwt.sign({ userId: user.id, role: user.role, plan: user.plan }, JWT_SECRET, { expiresIn: '24h' });
-    res.redirect(`/?oauth_token=${jwtToken}`);
+    res.redirect(`${PUBLIC_BASE || ''}/?oauth_token=${jwtToken}`);
   } catch (e) {
     res.status(500).send(`OAuth error: ${e.message}`);
   }
@@ -1564,21 +1584,18 @@ app.get('/api/auth/google', (req, res) => {
   const db = loadDb();
   const cfg = db.settings?.oauthConfig?.google || {};
   if (!cfg.clientId) return res.status(400).json({ ok: false, error: 'Google OAuth 未配置' });
-  const redirectUri = `${req.protocol}://${req.get('host')}/api/auth/google/callback`;
-  const state = crypto.randomBytes(16).toString('hex');
-  db.oauthStates = (db.oauthStates || []).filter(s => s.provider !== 'google' || s.expiresAt > Date.now());
-  db.oauthStates.push({ provider: 'google', state, expiresAt: Date.now() + 600_000 });
-  saveDb(db);
+  const redirectUri = `${publicOrigin(req)}/api/auth/google/callback`;
+  const state = beginOAuthState(res, 'google');
   res.json({ ok: true, url: `https://accounts.google.com/o/oauth2/v2/auth?client_id=${encodeURIComponent(cfg.clientId)}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=openid%20email%20profile&state=${state}` });
 });
 
 app.get('/api/auth/google/callback', async (req, res) => {
   const { code, state } = req.query;
   if (!code) return res.status(400).send('Missing code');
+  if (!consumeOAuthState(req, res, 'google', state)) {
+    return res.status(400).send('Invalid or expired OAuth state');
+  }
   const db = loadDb();
-  const stateIdx = (db.oauthStates || []).findIndex(s => s.provider === 'google' && s.state === state && s.expiresAt > Date.now());
-  if (stateIdx < 0) return res.status(400).send('Invalid or expired OAuth state');
-  db.oauthStates.splice(stateIdx, 1);
   const cfg = db.settings?.oauthConfig?.google || {};
   if (!cfg.clientId || !cfg.clientSecret) return res.status(400).send('Google OAuth not configured');
   try {
@@ -1600,7 +1617,7 @@ app.get('/api/auth/google/callback', async (req, res) => {
       user = {
         id: `usr_gg_${gUser.id}`,
         username: (gUser.email || '').split('@')[0] || `gg_${gUser.id}`,
-        password: await bcrypt.hash(Math.random().toString(36).slice(2) + Date.now(), BCRYPT_ROUNDS),
+        password: await bcrypt.hash(randomPassword(), BCRYPT_ROUNDS),
         email: gUser.email || '',
         role: 'user', roleDetail: 'user',
         name: gUser.name || gUser.email,
@@ -1617,7 +1634,7 @@ app.get('/api/auth/google/callback', async (req, res) => {
     }
     saveDb(db);
     const jwtToken = jwt.sign({ userId: user.id, role: user.role, plan: user.plan }, JWT_SECRET, { expiresIn: '24h' });
-    res.redirect(`/?oauth_token=${jwtToken}`);
+    res.redirect(`${PUBLIC_BASE || ''}/?oauth_token=${jwtToken}`);
   } catch (e) {
     res.status(500).send(`OAuth error: ${e.message}`);
   }
@@ -1781,55 +1798,50 @@ app.post('/api/ai/generate', generateLimiter, async (req, res) => {
     slaMetrics.aiResponseTimes.push(Date.now() - aiStartTime);
     if (slaMetrics.aiResponseTimes.length > SLA_MAX_AI_RT) slaMetrics.aiResponseTimes.shift();
 
-    // --- 4. 记录使用量（加写锁，防止并发请求覆盖用量数据） ---
+    // --- 4. 记录使用量 ---
     if (userId) {
-      const release = await dbWriteLock.acquire();
-      try {
-        const dbAfter = loadDb();
-        if (!dbAfter.usage[userId]) dbAfter.usage[userId] = {};
-        if (!dbAfter.usage[userId][today]) dbAfter.usage[userId][today] = { tasks: 0, credits: 0, tokens: { input: 0, output: 0 }, cost: 0 };
-        const dayUsage = dbAfter.usage[userId][today];
-        dayUsage.tasks += 1;
-        dayUsage.credits += creditCost;
-        dayUsage.tokens.input += (inputTokens || 0);
-        dayUsage.tokens.output += (outputTokens || 0);
-        const cost = calcCost(apiModel || dispatch?.model, inputTokens || 0, outputTokens || 0);
-        dayUsage.cost += cost;
+      const dbAfter = loadDb();
+      if (!dbAfter.usage[userId]) dbAfter.usage[userId] = {};
+      if (!dbAfter.usage[userId][today]) dbAfter.usage[userId][today] = { tasks: 0, credits: 0, tokens: { input: 0, output: 0 }, cost: 0 };
+      const dayUsage = dbAfter.usage[userId][today];
+      dayUsage.tasks += 1;
+      dayUsage.credits += creditCost;
+      dayUsage.tokens.input += (inputTokens || 0);
+      dayUsage.tokens.output += (outputTokens || 0);
+      const cost = calcCost(apiModel || dispatch?.model, inputTokens || 0, outputTokens || 0);
+      dayUsage.cost += cost;
 
-        // 记录 token 日志
-        dbAfter.tokenLogs.push({
-          ts: new Date().toISOString(),
-          userId,
-          vendor: dispatch?.vendor,
-          model: apiModel || dispatch?.model,
-          roleId: dispatch?.roleId,
-          inputTokens: inputTokens || 0,
-          outputTokens: outputTokens || 0,
-          cost: Math.round(cost * 1_000_000) / 1_000_000,
-          stub,
-        });
-        // 只保留最近 5000 条 token 日志
-        if (dbAfter.tokenLogs.length > 5000) dbAfter.tokenLogs = dbAfter.tokenLogs.slice(-5000);
+      // 记录 token 日志
+      dbAfter.tokenLogs.push({
+        ts: new Date().toISOString(),
+        userId,
+        vendor: dispatch?.vendor,
+        model: apiModel || dispatch?.model,
+        roleId: dispatch?.roleId,
+        inputTokens: inputTokens || 0,
+        outputTokens: outputTokens || 0,
+        cost: Math.round(cost * 1_000_000) / 1_000_000,
+        stub,
+      });
+      // 只保留最近 5000 条 token 日志
+      if (dbAfter.tokenLogs.length > 5000) dbAfter.tokenLogs = dbAfter.tokenLogs.slice(-5000);
 
-        // --- 超额预警：自动触发告警 ---
-        if (limits.dailyTasks > 0 && user) {
-          const pct = dayUsage.tasks / limits.dailyTasks;
-          const prevPct = (dayUsage.tasks - 1) / limits.dailyTasks;
-          if (pct >= 1 && prevPct < 1) {
-            const cfg = dbAfter.settings?.alertsConfig || defaultAlerts();
-            const msg = `用户 ${user.username}（${plan}）达到每日上限 ${limits.dailyTasks} 次`;
-            sendWebhookAlert(cfg, '超额预警：用户达到上限', msg).catch(() => {});
-            sendEmailAlert(cfg, '超额预警：用户达到上限', msg).catch(() => {});
-            addLog(dbAfter, 'warn', user.username, '超额预警', msg);
-          } else if (pct >= 0.8 && prevPct < 0.8) {
-            addLog(dbAfter, 'warn', user.username, '用量预警', `用户已使用 ${Math.round(pct * 100)}% 每日任务额度（${dayUsage.tasks}/${limits.dailyTasks}）`);
-          }
+      // --- 超额预警：自动触发告警 ---
+      if (limits.dailyTasks > 0 && user) {
+        const pct = dayUsage.tasks / limits.dailyTasks;
+        const prevPct = (dayUsage.tasks - 1) / limits.dailyTasks;
+        if (pct >= 1 && prevPct < 1) {
+          const cfg = dbAfter.settings?.alertsConfig || defaultAlerts();
+          const msg = `用户 ${user.username}（${plan}）达到每日上限 ${limits.dailyTasks} 次`;
+          sendWebhookAlert(cfg, '超额预警：用户达到上限', msg).catch(() => {});
+          sendEmailAlert(cfg, '超额预警：用户达到上限', msg).catch(() => {});
+          addLog(dbAfter, 'warn', user.username, '超额预警', msg);
+        } else if (pct >= 0.8 && prevPct < 0.8) {
+          addLog(dbAfter, 'warn', user.username, '用量预警', `用户已使用 ${Math.round(pct * 100)}% 每日任务额度（${dayUsage.tasks}/${limits.dailyTasks}）`);
         }
-
-        saveDb(dbAfter);
-      } finally {
-        release();
       }
+
+      saveDb(dbAfter);
     }
 
     const usageWarning = (userId && limits.dailyTasks > 0) ? (() => {
@@ -2868,7 +2880,8 @@ if (fs.existsSync(DIST_PATH)) {
 }
 
 app.listen(PORT, () => {
-  console.log(`[zdf-backend] listening on http://0.0.0.0:${PORT}`);
+  console.log(`[zdf-backend] listening on http://0.0.0.0:${PORT}${PUBLIC_BASE || '/'}`);
+  if (PUBLIC_BASE) console.log(`[zdf-backend] public base ${PUBLIC_BASE} (API at ${PUBLIC_BASE}/api/)`);
   if (fs.existsSync(DIST_PATH)) console.log(`[zdf-backend] serving static from ${DIST_PATH}`);
   else console.log('[zdf-backend] dist/ 不存在，仅 API；开发时请与 Vite 同开或先 npm run build');
   // 异步重建 RAG 向量索引（不阻塞启动）
