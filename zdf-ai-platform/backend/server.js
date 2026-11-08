@@ -7,6 +7,7 @@ import express from 'express';
 import cors from 'cors';
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
@@ -20,6 +21,17 @@ import mammoth from 'mammoth';
 import PDFDocument from 'pdfkit';
 import Stripe from 'stripe';
 import CryptoJS from 'crypto-js';
+import {
+  sanitizeRagFilename,
+  RAG_ALLOWED_EXTS,
+  randomPassword,
+  generateOAuthState,
+  oauthStateCookieName,
+  oauthStateCookieOptions,
+  resetCodeMatches,
+  normalizePublicBase,
+  timingSafeEqualStr,
+} from './security-utils.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -28,12 +40,15 @@ const PORT = Number(process.env.PORT) || 3000;
 const DATA_PATH = path.join(__dirname, 'data', 'store.json');
 const DIST_PATH = path.join(__dirname, '..', 'dist');
 const RAG_DIR = path.join(__dirname, 'data', 'rag');
-const JWT_SECRET = process.env.JWT_SECRET || ('zdf_ai_' + Math.random().toString(36).slice(2) + Date.now().toString(36));
+const PUBLIC_BASE = normalizePublicBase(process.env.BASE_PATH);
+const JWT_SECRET = process.env.JWT_SECRET || (() => {
+  const fallback = 'zdf_ai_' + crypto.randomBytes(32).toString('hex');
+  console.warn('[安全警告] 未设置 JWT_SECRET 环境变量，已生成临时随机密钥。');
+  console.warn('[安全警告] 生产环境请务必设置强密码: export JWT_SECRET="$(openssl rand -hex 32)"');
+  console.warn('[安全警告] 服务器重启后旧 token 将全部失效（因为临时密钥每次不同）');
+  return fallback;
+})();
 const BCRYPT_ROUNDS = 10;
-if (!process.env.JWT_SECRET) {
-  console.warn('[安全警告] 未设置 JWT_SECRET 环境变量，已生成随机密钥。生产环境请务必设置: export JWT_SECRET="你的强密码"');
-  console.warn('[安全警告] 服务器重启后旧 token 将全部失效（因为随机密钥每次不同）');
-}
 
 // --- Stripe 支付配置 ---
 const STRIPE_SECRET = process.env.STRIPE_SECRET_KEY || '';
@@ -47,9 +62,8 @@ const ragStorage = multer.diskStorage({
     fs.mkdirSync(userDir, { recursive: true });
     cb(null, userDir);
   },
-  filename: (req, file, cb) => cb(null, `${Date.now()}_${Buffer.from(file.originalname, 'latin1').toString('utf8')}`),
+  filename: (_req, file, cb) => cb(null, sanitizeRagFilename(file.originalname)),
 });
-const RAG_ALLOWED_EXTS = ['.txt', '.md', '.csv', '.json', '.log', '.pdf', '.docx'];
 const ragUpload = multer({
   storage: ragStorage,
   limits: { fileSize: 20 * 1024 * 1024 },
@@ -93,6 +107,34 @@ function parseCookies(req) {
     if (k) obj[k.trim()] = decodeURIComponent(v.join('='));
   });
   return obj;
+}
+
+function oauthCookiePath() {
+  return PUBLIC_BASE || '/';
+}
+
+function beginOAuthState(res, provider) {
+  const state = generateOAuthState();
+  res.cookie(
+    oauthStateCookieName(provider),
+    state,
+    oauthStateCookieOptions({
+      secure: process.env.NODE_ENV === 'production',
+      path: oauthCookiePath(),
+    }),
+  );
+  return state;
+}
+
+function consumeOAuthState(req, res, provider, state) {
+  const cookies = parseCookies(req);
+  const expected = cookies[oauthStateCookieName(provider)] || '';
+  res.clearCookie(oauthStateCookieName(provider), {
+    httpOnly: true,
+    sameSite: 'lax',
+    path: oauthCookiePath(),
+  });
+  return !!(state && expected && timingSafeEqualStr(expected, String(state)));
 }
 
 /** Express 中间件：解析并注入 req.userId, req.userRole */
@@ -404,6 +446,7 @@ function defaultDb() {
     ragDocs: [],      // [{ id, userId, filename, originalName, chunks, createdAt, scope?, orgId? }]
     workflows: DEFAULT_WORKFLOWS,
     orgs: [],            // [{ id, name, ownerId, members: [{ userId, role }], createdAt }]
+    oauthStates: [],     // leftover field; OAuth CSRF state is cookie-bound, not stored here
     upgradeRequests: [], // [{ id, userId, username, fromPlan, toPlan, message, status, createdAt, reviewedAt, reviewNote }]
     orders: [],          // [{ id, userId, plan, amount, currency, provider, status, createdAt, paidAt, externalId }]
   };
@@ -611,6 +654,7 @@ function loadDb() {
     if (!Array.isArray(data.ragDocs)) data.ragDocs = [];
     if (!Array.isArray(data.workflows) || data.workflows.length === 0) data.workflows = DEFAULT_WORKFLOWS;
     if (!Array.isArray(data.orgs)) data.orgs = [];
+    if (!Array.isArray(data.oauthStates)) data.oauthStates = [];
     if (!Array.isArray(data.upgradeRequests)) data.upgradeRequests = [];
     if (!Array.isArray(data.orders)) data.orders = [];
     // 迁移：将明文密码自动 hash（兼容旧 store.json）
@@ -1005,12 +1049,27 @@ app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false 
 const ALLOWED_ORIGINS = process.env.CORS_ORIGINS
   ? process.env.CORS_ORIGINS.split(',').map(s => s.trim())
   : null; // null = 开发模式允许全部
+if (process.env.NODE_ENV === 'production' && !ALLOWED_ORIGINS) {
+  console.warn('[安全警告] 生产环境未设置 CORS_ORIGINS，当前允许任意来源跨域访问。建议设置: CORS_ORIGINS=https://zdfai.site');
+}
 app.use(cors({
   origin: ALLOWED_ORIGINS
     ? (origin, cb) => (!origin || ALLOWED_ORIGINS.includes(origin) ? cb(null, true) : cb(new Error('CORS blocked')))
     : true,
   credentials: true,
 }));
+
+if (PUBLIC_BASE) {
+  app.use((req, _res, next) => {
+    const raw = req.url || '';
+    if (raw === PUBLIC_BASE || raw.startsWith(`${PUBLIC_BASE}/`) || raw.startsWith(`${PUBLIC_BASE}?`)) {
+      let rest = raw.slice(PUBLIC_BASE.length);
+      if (!rest || rest.startsWith('?')) rest = `/${rest}`;
+      req.url = rest;
+    }
+    next();
+  });
+}
 
 // SLA 响应时间追踪中间件
 app.use((req, res, next) => {
@@ -1399,7 +1458,7 @@ app.post('/api/auth/forgot-password', authLimiter, async (req, res) => {
   if (!user) {
     return res.json({ ok: true, msg: '如果该邮箱已注册，将收到重置邮件' });
   }
-  const resetToken = Math.random().toString(36).slice(2) + Date.now().toString(36) + Math.random().toString(36).slice(2);
+  const resetToken = crypto.randomBytes(32).toString('hex');
   if (!db.resetTokens) db.resetTokens = [];
   db.resetTokens = db.resetTokens.filter(t => t.userId !== user.id);
   db.resetTokens.push({ token: resetToken, userId: user.id, expiresAt: Date.now() + 3600_000 });
@@ -1441,7 +1500,7 @@ app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
   if (!user) return res.status(400).json({ ok: false, error: '邮箱未注册' });
   const tokenRow = (db.resetTokens || []).find(t => t.userId === user.id && t.expiresAt > Date.now());
   if (!tokenRow) return res.status(400).json({ ok: false, error: '验证码无效或已过期' });
-  if (!tokenRow.token.toUpperCase().startsWith(code.toUpperCase().trim())) {
+  if (!resetCodeMatches(tokenRow.token, code)) {
     return res.status(400).json({ ok: false, error: '验证码错误' });
   }
   user.password = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
@@ -1451,19 +1510,26 @@ app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
   res.json({ ok: true });
 });
 
+function publicOrigin(req) {
+  return `${req.protocol}://${req.get('host')}${PUBLIC_BASE}`;
+}
+
 // --- OAuth: GitHub 登录 ---
 app.get('/api/auth/github', (req, res) => {
   const db = loadDb();
   const cfg = db.settings?.oauthConfig?.github || {};
   if (!cfg.clientId) return res.status(400).json({ ok: false, error: 'GitHub OAuth 未配置' });
-  const state = Math.random().toString(36).slice(2);
-  const redirectUri = `${req.protocol}://${req.get('host')}/api/auth/github/callback`;
+  const state = beginOAuthState(res, 'github');
+  const redirectUri = `${publicOrigin(req)}/api/auth/github/callback`;
   res.json({ ok: true, url: `https://github.com/login/oauth/authorize?client_id=${encodeURIComponent(cfg.clientId)}&redirect_uri=${encodeURIComponent(redirectUri)}&state=${state}&scope=user:email` });
 });
 
 app.get('/api/auth/github/callback', async (req, res) => {
-  const { code } = req.query;
+  const { code, state } = req.query;
   if (!code) return res.status(400).send('Missing code');
+  if (!consumeOAuthState(req, res, 'github', state)) {
+    return res.status(400).send('Invalid or expired OAuth state');
+  }
   const db = loadDb();
   const cfg = db.settings?.oauthConfig?.github || {};
   if (!cfg.clientId || !cfg.clientSecret) return res.status(400).send('GitHub OAuth not configured');
@@ -1490,7 +1556,7 @@ app.get('/api/auth/github/callback', async (req, res) => {
       user = {
         id: `usr_gh_${ghUser.id}`,
         username: ghUser.login || `gh_${ghUser.id}`,
-        password: await bcrypt.hash(Math.random().toString(36).slice(2) + Date.now(), BCRYPT_ROUNDS),
+        password: await bcrypt.hash(randomPassword(), BCRYPT_ROUNDS),
         email: primaryEmail,
         role: 'user', roleDetail: 'user',
         name: ghUser.name || ghUser.login,
@@ -1507,7 +1573,7 @@ app.get('/api/auth/github/callback', async (req, res) => {
     }
     saveDb(db);
     const jwtToken = jwt.sign({ userId: user.id, role: user.role, plan: user.plan }, JWT_SECRET, { expiresIn: '24h' });
-    res.redirect(`/?oauth_token=${jwtToken}`);
+    res.redirect(`${PUBLIC_BASE || ''}/?oauth_token=${jwtToken}`);
   } catch (e) {
     res.status(500).send(`OAuth error: ${e.message}`);
   }
@@ -1518,14 +1584,17 @@ app.get('/api/auth/google', (req, res) => {
   const db = loadDb();
   const cfg = db.settings?.oauthConfig?.google || {};
   if (!cfg.clientId) return res.status(400).json({ ok: false, error: 'Google OAuth 未配置' });
-  const redirectUri = `${req.protocol}://${req.get('host')}/api/auth/google/callback`;
-  const state = Math.random().toString(36).slice(2);
+  const redirectUri = `${publicOrigin(req)}/api/auth/google/callback`;
+  const state = beginOAuthState(res, 'google');
   res.json({ ok: true, url: `https://accounts.google.com/o/oauth2/v2/auth?client_id=${encodeURIComponent(cfg.clientId)}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=openid%20email%20profile&state=${state}` });
 });
 
 app.get('/api/auth/google/callback', async (req, res) => {
-  const { code } = req.query;
+  const { code, state } = req.query;
   if (!code) return res.status(400).send('Missing code');
+  if (!consumeOAuthState(req, res, 'google', state)) {
+    return res.status(400).send('Invalid or expired OAuth state');
+  }
   const db = loadDb();
   const cfg = db.settings?.oauthConfig?.google || {};
   if (!cfg.clientId || !cfg.clientSecret) return res.status(400).send('Google OAuth not configured');
@@ -1548,7 +1617,7 @@ app.get('/api/auth/google/callback', async (req, res) => {
       user = {
         id: `usr_gg_${gUser.id}`,
         username: (gUser.email || '').split('@')[0] || `gg_${gUser.id}`,
-        password: await bcrypt.hash(Math.random().toString(36).slice(2) + Date.now(), BCRYPT_ROUNDS),
+        password: await bcrypt.hash(randomPassword(), BCRYPT_ROUNDS),
         email: gUser.email || '',
         role: 'user', roleDetail: 'user',
         name: gUser.name || gUser.email,
@@ -1565,7 +1634,7 @@ app.get('/api/auth/google/callback', async (req, res) => {
     }
     saveDb(db);
     const jwtToken = jwt.sign({ userId: user.id, role: user.role, plan: user.plan }, JWT_SECRET, { expiresIn: '24h' });
-    res.redirect(`/?oauth_token=${jwtToken}`);
+    res.redirect(`${PUBLIC_BASE || ''}/?oauth_token=${jwtToken}`);
   } catch (e) {
     res.status(500).send(`OAuth error: ${e.message}`);
   }
@@ -1689,7 +1758,7 @@ app.post('/api/ai/generate', generateLimiter, async (req, res) => {
 
   // --- 0. Free 用户模型白名单检查 ---
   if (plan === 'free' && dispatch?.vendor) {
-    const FREE_ALLOWED = { deepseek: true, alibaba: true, openai: ['gpt-4.1-mini', 'gpt-4o-mini'] };
+    const FREE_ALLOWED = { deepseek: true, alibaba: true, openai: ['gpt-4.1-mini'] };
     const v = dispatch.vendor.toLowerCase();
     const allowed = FREE_ALLOWED[v];
     if (!allowed) {
@@ -2168,8 +2237,9 @@ app.get('/api/user/can-export', requireAuth, (req, res) => {
 // --- 用户 API Key 管理 (Pro+) ---
 function generateApiKey() {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  const bytes = crypto.randomBytes(32);
   let key = 'zdf_ak_';
-  for (let i = 0; i < 32; i++) key += chars[Math.floor(Math.random() * chars.length)];
+  for (let i = 0; i < 32; i++) key += chars[bytes[i] % chars.length];
   return key;
 }
 
@@ -2657,7 +2727,7 @@ async function sendSmsAlert(alertsConfig, title, content) {
         RegionId: 'cn-hangzhou',
         SignName: smsSign,
         SignatureMethod: 'HMAC-SHA1',
-        SignatureNonce: `${Date.now()}_${Math.random().toString(36).slice(2)}`,
+        SignatureNonce: `${Date.now()}_${crypto.randomBytes(8).toString('hex')}`,
         SignatureVersion: '1.0',
         TemplateCode: smsTemplate,
         TemplateParam: JSON.stringify({ title: title.slice(0, 20), content: content.slice(0, 100) }),
@@ -2810,7 +2880,8 @@ if (fs.existsSync(DIST_PATH)) {
 }
 
 app.listen(PORT, () => {
-  console.log(`[zdf-backend] listening on http://0.0.0.0:${PORT}`);
+  console.log(`[zdf-backend] listening on http://0.0.0.0:${PORT}${PUBLIC_BASE || '/'}`);
+  if (PUBLIC_BASE) console.log(`[zdf-backend] public base ${PUBLIC_BASE} (API at ${PUBLIC_BASE}/api/)`);
   if (fs.existsSync(DIST_PATH)) console.log(`[zdf-backend] serving static from ${DIST_PATH}`);
   else console.log('[zdf-backend] dist/ 不存在，仅 API；开发时请与 Vite 同开或先 npm run build');
   // 异步重建 RAG 向量索引（不阻塞启动）
