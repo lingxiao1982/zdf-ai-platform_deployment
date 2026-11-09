@@ -8,6 +8,8 @@
     "dev:full": "concurrently -k -n web,api -c cyan,magenta \"vite\" \"npm run dev --prefix backend\"",
     "build": "vite build",
     "build:bestanswer": "BASE_PATH=/BestAnswer vite build",
+    "verify:bestanswer": "node ../scripts/verify-bestanswer.mjs",
+    "test:bestanswer-verify": "node --test ../scripts/verify-bestanswer.test.mjs ../scripts/nginx-location-priority.test.mjs",
     "preview": "vite preview",
     "start": "npm run build && npm start --prefix backend",
     "api": "npm start --prefix backend"
