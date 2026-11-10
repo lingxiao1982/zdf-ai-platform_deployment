@@ -38,7 +38,7 @@ const FALLBACK_VENDORS = [
   { id: 'anthropic', name: 'Anthropic', region: 'US', models: ['claude-sonnet-4-6', 'claude-opus-4-8', 'claude-haiku-4-5', 'claude-sonnet-4-5'] },
   { id: 'google', name: 'Google', region: 'US', models: ['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-2.5-flash-lite'] },
   { id: 'deepseek', name: 'DeepSeek (深度求索)', region: 'CN', models: ['deepseek-v4-pro', 'deepseek-v4-flash', 'deepseek-chat', 'deepseek-reasoner'] },
-  { id: 'alibaba', name: 'Alibaba (阿里)', region: 'CN', models: ['qwen-max', 'qwen-plus', 'qwen-turbo', 'qwq-plus', 'qwen3-coder-plus'] },
+  { id: 'alibaba', name: 'Alibaba (阿里)', region: 'CN', models: ['qwen3.8-max', 'qwen3.7-plus', 'qwen3.8-flash'] },
   { id: 'zhipu', name: 'Zhipu (智谱)', region: 'CN', models: ['glm-5.1', 'glm-5', 'glm-4-plus', 'glm-4'] },
   { id: 'doubao', name: 'Doubao (豆包)', region: 'CN', models: ['doubao-seed-2.0-pro', 'doubao-seed-2.0-lite', 'doubao-seed-2.0-code', 'doubao-pro-128k'] },
   { id: 'moonshot', name: 'Moonshot (月之暗面)', region: 'CN', models: ['kimi-k2.6', 'kimi-k2.5', 'moonshot-v1-128k'] },
@@ -1122,7 +1122,7 @@ const AdminApp = ({ auth, onLogout, dbUsers, setDbUsers, isTestMode, setIsTestMo
                </div>
               {vendors.map(v => {
                 const kSt = adminKeys[v.id] || { value: '', status: 'idle', msg: '' };
-                const keyHints = { openai: 'sk-... (OpenAI Dashboard)', anthropic: 'sk-ant-... (Anthropic Console)', google: 'AIza... (Google AI Studio)', deepseek: 'sk-... (DeepSeek 开放平台)', alibaba: 'sk-... (阿里云百炼)', zhipu: '... (智谱 开放平台)', doubao: '火山方舟控制台 → API Key 管理（非火山引擎 AccessKey）', moonshot: 'sk-... (Moonshot 开放平台)', ollama: '本地模型无需 Key', vllm: '本地模型无需 Key' };
+                const keyHints = { openai: 'sk-... (OpenAI Dashboard)', anthropic: 'sk-ant-... (Anthropic Console)', google: 'AIza... (Google AI Studio)', deepseek: 'sk-... (DeepSeek 开放平台)', alibaba: 'sk-ws-... (千问AI平台)', zhipu: '... (智谱 开放平台)', doubao: '火山方舟控制台 → API Key 管理（非火山引擎 AccessKey）', moonshot: 'sk-... (Moonshot 开放平台)', ollama: '本地模型无需 Key', vllm: '本地模型无需 Key' };
                 const hint = keyHints[v.id] || '填写 API Key';
                 return (
                   <div key={v.id} className="bg-white border border-gray-200 rounded-xl p-4 shadow-sm">
@@ -1703,7 +1703,7 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, onUpdate
 
   const [configs, setConfigs] = useState({
     A: { vendor: 'deepseek', model: 'deepseek-v4-pro', mode: 'platform', key: '' },
-    B: { vendor: 'alibaba', model: 'qwen-max', mode: 'platform', key: '' },
+    B: { vendor: 'alibaba', model: 'qwen3.8-max', mode: 'platform', key: '' },
     C: { vendor: 'anthropic', model: 'claude-sonnet-4-6', mode: 'platform', key: '' },
     D: { vendor: 'openai', model: 'gpt-4.1', mode: 'platform', key: '' },
   });
