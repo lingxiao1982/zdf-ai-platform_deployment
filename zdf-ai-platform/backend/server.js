@@ -83,10 +83,17 @@ async function verifyPassword(plain, stored) {
   return plain === stored;
 }
 
-/** 从 JWT token 解析用户 ID，兼容旧的 session_token_xxx 格式 */
+/** 从 JWT token 解析用户 ID，兼容旧的 session_token_xxx 格式。
+ * 优先 Authorization: Bearer；没有 Bearer 时回退到 httpOnly `token` cookie（与 authMiddleware 一致）。
+ * 历史接口不走 zdf_ak_ API Key。
+ */
 function parseUserIdFromAuth(req) {
   const h = req.headers.authorization || '';
-  const token = h.replace(/^Bearer\s+/i, '').trim();
+  let token = h.replace(/^Bearer\s+/i, '').trim();
+  if (!token) {
+    const cookies = parseCookies(req);
+    token = cookies.token || '';
+  }
   if (!token) return '';
   // 兼容旧格式 session_token_xxx
   const legacy = /^session_token_(.+)$/i.exec(token);
@@ -111,6 +118,37 @@ function parseCookies(req) {
 
 function oauthCookiePath() {
   return PUBLIC_BASE || '/';
+}
+
+/** Auth `token` cookie options: Path is PUBLIC_BASE / BASE_PATH when set, else `/`.
+ *  Production sets Secure, matching OAuth state cookies. HttpOnly and SameSite=Lax stay on.
+ */
+function authTokenCookieOptions() {
+  return {
+    httpOnly: true,
+    sameSite: 'lax',
+    maxAge: 24 * 60 * 60 * 1000,
+    path: oauthCookiePath(),
+    secure: process.env.NODE_ENV === 'production',
+  };
+}
+
+/** Expire a leftover pre-fix `token` cookie that was issued with Path=/ and no Secure. */
+function legacyAuthTokenClearOptions() {
+  return { httpOnly: true, sameSite: 'lax', path: '/' };
+}
+
+function setAuthTokenCookie(res, token) {
+  res.cookie('token', token, authTokenCookieOptions());
+  if (oauthCookiePath() !== '/') {
+    res.clearCookie('token', legacyAuthTokenClearOptions());
+  }
+}
+
+function clearAuthTokenCookies(res) {
+  const { maxAge, ...clearOpts } = authTokenCookieOptions();
+  res.clearCookie('token', clearOpts);
+  res.clearCookie('token', legacyAuthTokenClearOptions());
 }
 
 function beginOAuthState(res, provider) {
@@ -1266,7 +1304,7 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
   addLog(db, 'info', username, '登录成功', `套餐: ${user.plan}，IP: ${req.ip}`);
   saveDb(db);
   // 设置 httpOnly cookie (L02: 防 XSS)
-  res.cookie('token', token, { httpOnly: true, sameSite: 'lax', maxAge: 24 * 60 * 60 * 1000, path: '/' });
+  setAuthTokenCookie(res, token);
   res.json({ ok: true, token, user: { id: user.id, username: user.username, role: user.role, roleDetail: user.roleDetail, name: user.name, plan: user.plan, status: user.status, balance: user.balance, permissions } });
 });
 
@@ -1288,7 +1326,7 @@ app.post('/api/auth/change-password', requireAuth, async (req, res) => {
 
 // --- 登出（清除 httpOnly cookie）---
 app.post('/api/auth/logout', (_req, res) => {
-  res.clearCookie('token', { httpOnly: true, sameSite: 'lax', path: '/' });
+  clearAuthTokenCookies(res);
   res.json({ ok: true });
 });
 
@@ -1445,7 +1483,7 @@ app.post('/api/auth/register', registerLimiter, async (req, res) => {
   addLog(db, 'info', safeUser.username, '用户注册', `新用户注册，套餐: ${safeUser.plan}`);
   saveDb(db);
   const token = jwt.sign({ userId: safeUser.id, role: safeUser.role, plan: safeUser.plan }, JWT_SECRET, { expiresIn: '24h' });
-  res.cookie('token', token, { httpOnly: true, sameSite: 'lax', maxAge: 24 * 60 * 60 * 1000, path: '/' });
+  setAuthTokenCookie(res, token);
   res.json({ ok: true, token, user: { id: safeUser.id, username: safeUser.username, role: safeUser.role, roleDetail: safeUser.roleDetail, name: safeUser.name, plan: safeUser.plan, status: safeUser.status, balance: safeUser.balance, email: safeUser.email } });
 });
 
