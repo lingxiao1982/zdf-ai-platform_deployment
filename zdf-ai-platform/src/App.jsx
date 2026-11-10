@@ -3383,3 +3383,5 @@ export default function App() {
     );
   }
 }
+
+export { AdminApp, UserApp, FALLBACK_VENDORS };
