@@ -18,6 +18,20 @@ import {
   DeployChecklist,
   OrgKnowledgeBase,
 } from './crash-view-panels.jsx';
+import {
+  ROLE_DISABLED_VENDOR,
+  SKIPPED_LABEL,
+  isRoleConfigured,
+  getUnconfiguredOptionalRoles,
+  formatUnconfiguredReminder,
+  generatorRequiredMessage,
+  buildPipelinePlan,
+  lastCompletedOutput,
+  buildRoleBPrompt,
+  buildRoleCPrompt,
+  buildRoleDPrompt,
+  pickFinalResult,
+} from './pipeline-roles.js';
 
 const ROLES = [
   { id: 'A', name: '生成者', description: '给出初始答案', icon: <MessageSquare size={18} /> },
@@ -174,10 +188,18 @@ const PipelineAnimation = ({ currentStep, configs, results, vendors, isComplete 
     { id: 'C', label: '审核者', desc: '质量与风险审核' },
     { id: 'D', label: '终审者', desc: '终审并输出结果' },
   ];
+  const skipped = results?.skipped || {};
   const stepIdx = steps.findIndex(s => s.id === currentStep);
 
+  /**
+   * @param {number} i
+   * @returns {'done' | 'active' | 'pending' | 'skipped'}
+   */
   const getStatus = (i) => {
+    const id = steps[i].id;
+    if (skipped[id]) return 'skipped';
     if (isComplete) return 'done';
+    if (stepIdx < 0) return 'pending';
     if (i < stepIdx) return 'done';
     if (i === stepIdx) return 'active';
     return 'pending';
@@ -185,7 +207,7 @@ const PipelineAnimation = ({ currentStep, configs, results, vendors, isComplete 
 
   const getVendorModel = (roleId) => {
     const c = configs[roleId];
-    if (!c) return { vName: '', mName: '' };
+    if (!c || !isRoleConfigured(c)) return { vName: SKIPPED_LABEL, mName: '' };
     const v = vendors.find(x => x.id === c.vendor);
     return { vName: v ? v.name : c.vendor, mName: c.model };
   };
@@ -220,13 +242,16 @@ const PipelineAnimation = ({ currentStep, configs, results, vendors, isComplete 
               <div className="flex flex-col items-center" style={{ minWidth: 110 }}>
                 <div
                   className={`relative w-14 h-14 rounded-2xl flex items-center justify-center text-lg font-black border-2 transition-all duration-500 ${
-                    status === 'done'
+                    status === 'skipped'
+                      ? 'bg-slate-100 border-slate-200 text-slate-400'
+                      : status === 'done'
                       ? (isComplete ? 'bg-gradient-to-br from-amber-400 to-yellow-500 border-amber-400 text-white shadow-lg pl-done-glow' : 'bg-emerald-500 border-emerald-400 text-white shadow-md')
                       : status === 'active'
                       ? 'bg-indigo-600 border-indigo-400 text-white pl-node-active'
                       : 'bg-gray-100 border-gray-200 text-gray-400'
                   }`}
                 >
+                  {status === 'skipped' && <span className="text-xs font-bold">—</span>}
                   {status === 'done' && !isComplete && (
                     <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}><path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7"/></svg>
                   )}
@@ -236,11 +261,16 @@ const PipelineAnimation = ({ currentStep, configs, results, vendors, isComplete 
                   )}
                   {status === 'pending' && <span className="text-base">{step.id}</span>}
                 </div>
-                <div className={`mt-2 text-xs font-bold ${status === 'active' ? 'text-indigo-600' : status === 'done' ? (isComplete ? 'text-amber-600' : 'text-emerald-600') : 'text-gray-400'}`}>
+                <div className={`mt-2 text-xs font-bold ${
+                  status === 'skipped' ? 'text-slate-400'
+                    : status === 'active' ? 'text-indigo-600'
+                    : status === 'done' ? (isComplete ? 'text-amber-600' : 'text-emerald-600')
+                    : 'text-gray-400'
+                }`}>
                   {step.label}
                 </div>
-                <div className="text-[10px] text-gray-400 mt-0.5 text-center leading-tight truncate max-w-[110px]">
-                  {status === 'active' ? `${vName} · ${mName}` : step.desc}
+                <div className={`text-[10px] mt-0.5 text-center leading-tight truncate max-w-[110px] ${status === 'skipped' ? 'text-slate-400 font-medium' : 'text-gray-400'}`}>
+                  {status === 'skipped' ? SKIPPED_LABEL : status === 'active' ? `${vName} · ${mName}` : step.desc}
                 </div>
               </div>
 
@@ -248,7 +278,9 @@ const PipelineAnimation = ({ currentStep, configs, results, vendors, isComplete 
               {i < steps.length - 1 && (
                 <div className="relative flex-1 mx-1" style={{ minWidth: 40, height: 4 }}>
                   <div className={`absolute inset-0 rounded-full transition-colors duration-500 ${
-                    getStatus(i + 1) !== 'pending' || status === 'active'
+                    status === 'skipped' || getStatus(i + 1) === 'skipped'
+                      ? 'bg-slate-200'
+                      : getStatus(i + 1) !== 'pending' || status === 'active'
                       ? (isComplete ? 'bg-gradient-to-r from-amber-400 to-yellow-400' : 'bg-indigo-200')
                       : 'bg-gray-200'
                   }`} />
@@ -266,7 +298,7 @@ const PipelineAnimation = ({ currentStep, configs, results, vendors, isComplete 
       </div>
 
       {/* Status text */}
-      {!isComplete && currentStep && (
+      {!isComplete && currentStep && !skipped[currentStep] && (
         <div className="text-center mt-5">
           <span className="inline-flex items-center gap-2 px-4 py-2 bg-indigo-50 rounded-full text-sm text-indigo-700 font-bold">
             <span className="w-2 h-2 rounded-full bg-indigo-500 animate-pulse" />
@@ -1790,27 +1822,60 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, onUpdate
   }, [showComplete]);
 
   const RoleConfigUser = ({ role, config, onUpdate }) => {
+    const optional = role.id !== 'A';
+    const disabled = !isRoleConfigured(config);
     const currentVendor = vendors.find(v => v.id === config.vendor) || vendors[0];
+    const vendorValue = disabled && optional ? ROLE_DISABLED_VENDOR : (config.vendor || currentVendor?.id || '');
     return (
-      <div className="p-4 border-b border-gray-100 last:border-0 hover:bg-gray-50">
+      <div className={`p-4 border-b border-gray-100 last:border-0 hover:bg-gray-50 ${disabled && optional ? 'opacity-75' : ''}`}>
         <div className="flex items-center gap-2 mb-3">
-          <div className="p-1.5 bg-indigo-100 text-indigo-600 rounded">{role.icon}</div>
-          <div><h4 className="text-sm font-bold text-gray-800">{role.id} · {role.name}</h4></div>
+          <div className={`p-1.5 rounded ${disabled && optional ? 'bg-slate-100 text-slate-400' : 'bg-indigo-100 text-indigo-600'}`}>{role.icon}</div>
+          <div>
+            <h4 className="text-sm font-bold text-gray-800">{role.id} · {role.name}</h4>
+            {role.id === 'A' && <p className="text-[10px] text-gray-400 mt-0.5">必选 · 未配置将无法执行</p>}
+            {optional && disabled && <p className="text-[10px] text-slate-400 mt-0.5">不启用 · 执行时跳过</p>}
+          </div>
         </div>
         <div className="space-y-2">
           <div className="flex gap-2">
-            <select className="w-1/2 text-xs p-2 border rounded bg-white" value={config.vendor} onChange={(e) => { const vendor = vendors.find(v => v.id === e.target.value); onUpdate(role.id, { vendor: e.target.value, model: vendor.models[0] }); }}>
+            <select
+              className="w-1/2 text-xs p-2 border rounded bg-white"
+              value={vendorValue}
+              onChange={(e) => {
+                const val = e.target.value;
+                if (val === ROLE_DISABLED_VENDOR) {
+                  onUpdate(role.id, { vendor: ROLE_DISABLED_VENDOR, model: '', enabled: false });
+                  return;
+                }
+                const vendor = vendors.find(v => v.id === val);
+                onUpdate(role.id, { vendor: val, model: vendor?.models?.[0] || '', enabled: true });
+              }}
+            >
+              {optional && <option value={ROLE_DISABLED_VENDOR}>不启用</option>}
               <optgroup label="海外厂商">{vendors.filter(v => v.region === 'US').map(v => <option key={v.id} value={v.id}>{v.name}</option>)}</optgroup>
               <optgroup label="国内厂商">{vendors.filter(v => v.region === 'CN').map(v => <option key={v.id} value={v.id}>{v.name}</option>)}</optgroup>
               {vendors.some(v => v.region === 'LOCAL') && <optgroup label="本地模型">{vendors.filter(v => v.region === 'LOCAL').map(v => <option key={v.id} value={v.id}>{v.name}</option>)}</optgroup>}
             </select>
-            <select className="w-1/2 text-[11px] p-2 border rounded bg-white" value={config.model} onChange={(e) => onUpdate(role.id, { model: e.target.value })}>{currentVendor.models.map(m => <option key={m} value={m}>{m}</option>)}</select>
+            <select
+              className="w-1/2 text-[11px] p-2 border rounded bg-white disabled:bg-gray-50 disabled:text-gray-400"
+              value={disabled ? '' : config.model}
+              disabled={disabled}
+              onChange={(e) => onUpdate(role.id, { model: e.target.value })}
+            >
+              {disabled
+                ? <option value="">—</option>
+                : currentVendor.models.map(m => <option key={m} value={m}>{m}</option>)}
+            </select>
           </div>
-          <select className="w-full text-xs p-2 border rounded bg-white" value={config.mode} onChange={(e) => onUpdate(role.id, { mode: e.target.value })}>
-            <option value="platform">⚡ 平台内置 API</option>
-            <option value="self">🔑 自带 API Key</option>
-          </select>
-          {config.mode === 'self' && <input type="password" placeholder="输入 API Key" className="w-full text-xs p-2 border rounded" value={config.key} onChange={(e) => onUpdate(role.id, { key: e.target.value })} />}
+          {!disabled && (
+            <>
+              <select className="w-full text-xs p-2 border rounded bg-white" value={config.mode} onChange={(e) => onUpdate(role.id, { mode: e.target.value })}>
+                <option value="platform">⚡ 平台内置 API</option>
+                <option value="self">🔑 自带 API Key</option>
+              </select>
+              {config.mode === 'self' && <input type="password" placeholder="输入 API Key" className="w-full text-xs p-2 border rounded" value={config.key} onChange={(e) => onUpdate(role.id, { key: e.target.value })} />}
+            </>
+          )}
         </div>
       </div>
     );
@@ -1905,8 +1970,15 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, onUpdate
     };
   };
 
+  const unconfiguredOptional = getUnconfiguredOptionalRoles(configs, ROLES);
+  const unconfiguredReminder = formatUnconfiguredReminder(unconfiguredOptional);
+
   const runPipeline = async () => {
     if (!question.trim() && attachments.length === 0) return;
+    if (!isRoleConfigured(configs.A)) {
+      alert(generatorRequiredMessage());
+      return;
+    }
     const limits = PLAN_LIMITS[auth.plan] || PLAN_LIMITS.free;
     if (limits.dailyTasks > 0 && dailyTasksUsed >= limits.dailyTasks) {
       setUpgradePrompt({ title: '今日任务已达上限', desc: `您已使用 ${limits.dailyTasks} 次任务额度。升级到 Pro 可获取每日 500 次任务、RAG 知识库、文件导出等专业能力。`, feature: 'tasks' });
@@ -1915,44 +1987,70 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, onUpdate
     setIsRunning(true);
     setShowComplete(false);
     setResultTab('final');
-    const newResults = { A: '', B: '', C: '', D: '', final: '' };
+    const plan = buildPipelinePlan(configs);
+    const skipped = Object.fromEntries(plan.filter((s) => s.action === 'skip').map((s) => [s.id, true]));
+    /** 流水线 Credit 记在最后一个实际执行的角色上（全开时仍为 D，与现网一致） */
+    const billableRoleId = [...plan].reverse().find((s) => s.action === 'run')?.id || 'A';
+    const pipelineCreditFor = (roleId) => (roleId === billableRoleId ? CREDIT_COSTS.pipeline : 0);
+    const newResults = { A: '', B: '', C: '', D: '', final: '', skipped: { ...skipped } };
+    setResults({ ...newResults });
 
     try {
+      // A 必选；若 plan 中 A 为 skip 已在入口拦截
       setCurrentStep('A');
-      const ragExtra = useRag ? { useRag: true, creditCost: CREDIT_COSTS.rag } : { creditCost: 0 };
+      const aCredit = useRag ? CREDIT_COSTS.rag : pipelineCreditFor('A');
+      const ragExtra = useRag
+        ? { useRag: true, creditCost: aCredit }
+        : { creditCost: aCredit };
       newResults.A = await callGemini(question, '直接回答用户问题。', attachments, buildDispatch('A'), ragExtra);
       setResults({ ...newResults });
 
-      setCurrentStep('B');
-      newResults.B = await callGemini(
-        `问题: ${question}\n初稿:\n${newResults.A}\n任务: 事实校核。`,
-        '你是一个严格的事实校核员。',
-        attachments,
-        buildDispatch('B'),
-        { creditCost: 0 },
-      );
-      setResults({ ...newResults });
+      if (skipped.B) {
+        newResults.B = '';
+        setResults({ ...newResults });
+      } else {
+        setCurrentStep('B');
+        newResults.B = await callGemini(
+          buildRoleBPrompt(question, newResults.A),
+          '你是一个严格的事实校核员。',
+          attachments,
+          buildDispatch('B'),
+          { creditCost: pipelineCreditFor('B') },
+        );
+        setResults({ ...newResults });
+      }
 
-      setCurrentStep('C');
-      newResults.C = await callGemini(
-        `校核稿:\n${newResults.B}\n任务: 润色。`,
-        '你是一个专业的审核专家。',
-        attachments,
-        buildDispatch('C'),
-        { creditCost: 0 },
-      );
-      setResults({ ...newResults });
+      if (skipped.C) {
+        newResults.C = '';
+        setResults({ ...newResults });
+      } else {
+        setCurrentStep('C');
+        const priorForC = lastCompletedOutput(newResults, skipped, ['A', 'B']);
+        newResults.C = await callGemini(
+          buildRoleCPrompt(priorForC),
+          '你是一个专业的审核专家。',
+          attachments,
+          buildDispatch('C'),
+          { creditCost: pipelineCreditFor('C') },
+        );
+        setResults({ ...newResults });
+      }
 
-      setCurrentStep('D');
-      const resD = await callGemini(
-        `原始问题: ${question}\n\n阶段A（生成者）输出:\n${newResults.A}\n\n阶段B（校核者）输出:\n${newResults.B}\n\n阶段C（审核者）输出:\n${newResults.C}\n\n任务: 作为终审者，根据策略输出最终纯文本结果。`,
-        '',
-        attachments,
-        buildDispatch('D'),
-        { strategy, creditCost: CREDIT_COSTS.pipeline },
-      );
-      newResults.D = stripMarkdown(resD);
-      newResults.final = newResults.D;
+      if (skipped.D) {
+        newResults.D = '';
+        newResults.final = pickFinalResult(newResults, plan);
+      } else {
+        setCurrentStep('D');
+        const resD = await callGemini(
+          buildRoleDPrompt(question, newResults, skipped),
+          '',
+          attachments,
+          buildDispatch('D'),
+          { strategy, creditCost: pipelineCreditFor('D') },
+        );
+        newResults.D = stripMarkdown(resD);
+        newResults.final = newResults.D;
+      }
       setShowComplete(true);
       setScores(calcScores(newResults));
 
@@ -1960,7 +2058,7 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, onUpdate
       const histEntry = {
         id: Date.now(),
         question,
-        answer: newResults.D,
+        answer: newResults.final,
         timestamp: new Date().toLocaleTimeString(),
         strategyName: STRATEGIES.find((s) => s.id === strategy).name,
       };
@@ -2118,6 +2216,11 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, onUpdate
             <div className="p-4 border-b border-gray-100"><h2 className="font-bold flex items-center gap-2"><Zap size={18} className="text-amber-500" /> 调度设置</h2></div>
             <div className="flex-1 flex flex-col">
               {ROLES.map(role => <RoleConfigUser key={role.id} role={role} config={configs[role.id]} onUpdate={(id, part) => setConfigs(p => ({ ...p, [id]: { ...p[id], ...part } }))} />)}
+              {unconfiguredReminder && (
+                <div className="mx-4 mb-4 mt-1 px-3 py-2.5 rounded-xl bg-amber-50 border border-amber-100 text-amber-800 text-xs leading-relaxed">
+                  {unconfiguredReminder}
+                </div>
+              )}
             </div>
             <div className="p-4 bg-gray-50 border-t border-gray-100">
               <label className="text-xs font-bold text-gray-400 block mb-1">终审策略</label>
@@ -2195,22 +2298,29 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, onUpdate
                       )}
                       {results.final && resultTab==='steps' && (
                         <div className="space-y-4">
-                          {ROLES.map(r => (
-                            <div key={r.id} className="p-4 bg-gray-50 rounded-lg text-sm text-gray-700">
-                              <div className="flex items-center justify-between mb-2">
-                                <strong className="text-gray-800">{r.id} · {r.name}</strong>
-                                {scores[r.id] > 0 && (
-                                  <div className="flex items-center gap-2">
-                                    <div className="w-20 h-2 bg-gray-200 rounded-full overflow-hidden">
-                                      <div className={`h-full rounded-full transition-all ${scores[r.id] >= 80 ? 'bg-green-500' : scores[r.id] >= 50 ? 'bg-amber-500' : 'bg-red-400'}`} style={{width: `${scores[r.id]}%`}} />
+                          {ROLES.map(r => {
+                            const wasSkipped = Boolean(results.skipped?.[r.id]);
+                            return (
+                              <div key={r.id} className={`p-4 rounded-lg text-sm ${wasSkipped ? 'bg-slate-50 text-slate-500 border border-dashed border-slate-200' : 'bg-gray-50 text-gray-700'}`}>
+                                <div className="flex items-center justify-between mb-2">
+                                  <strong className={wasSkipped ? 'text-slate-500' : 'text-gray-800'}>{r.id} · {r.name}</strong>
+                                  {wasSkipped ? (
+                                    <span className="text-[11px] font-bold px-2 py-0.5 rounded-full bg-slate-200 text-slate-600">{SKIPPED_LABEL}</span>
+                                  ) : scores[r.id] > 0 ? (
+                                    <div className="flex items-center gap-2">
+                                      <div className="w-20 h-2 bg-gray-200 rounded-full overflow-hidden">
+                                        <div className={`h-full rounded-full transition-all ${scores[r.id] >= 80 ? 'bg-green-500' : scores[r.id] >= 50 ? 'bg-amber-500' : 'bg-red-400'}`} style={{width: `${scores[r.id]}%`}} />
+                                      </div>
+                                      <span className={`text-xs font-bold ${scores[r.id] >= 80 ? 'text-green-600' : scores[r.id] >= 50 ? 'text-amber-600' : 'text-red-500'}`}>{scores[r.id]}分</span>
                                     </div>
-                                    <span className={`text-xs font-bold ${scores[r.id] >= 80 ? 'text-green-600' : scores[r.id] >= 50 ? 'text-amber-600' : 'text-red-500'}`}>{scores[r.id]}分</span>
-                                  </div>
-                                )}
+                                  ) : null}
+                                </div>
+                                <div className="whitespace-pre-wrap">
+                                  {wasSkipped ? SKIPPED_LABEL : results[r.id]}
+                                </div>
                               </div>
-                              <div className="whitespace-pre-wrap">{results[r.id]}</div>
-                            </div>
-                          ))}
+                            );
+                          })}
                         </div>
                       )}
                     </div>
