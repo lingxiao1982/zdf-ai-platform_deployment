@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "test": "node --test test.js security-utils.test.js auth-cookie.test.js"
+    "test": "node --test test.js security-utils.test.js auth-cookie.test.js alibaba-qianwen.test.js"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",

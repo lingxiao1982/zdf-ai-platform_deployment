@@ -32,6 +32,7 @@ import {
   normalizePublicBase,
   timingSafeEqualStr,
 } from './security-utils.js';
+import { resolveApiModel } from './vendor-resolve.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -596,7 +597,7 @@ async function getEmbeddings(texts, db) {
   const vendors = [
     { id: 'openai', base: 'https://api.openai.com/v1/embeddings', model: 'text-embedding-3-small' },
     { id: 'deepseek', base: 'https://api.deepseek.com/v1/embeddings', model: 'deepseek-embedding' },
-    { id: 'alibaba', base: 'https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings', model: 'text-embedding-v3' },
+    { id: 'alibaba', base: 'https://maas.qianwenaiapi.com/compatible-mode/v1/embeddings', model: 'qwen3.7-text-embedding' },
   ];
   for (const v of vendors) {
     const keyObj = (db.keys || {})[v.id];
@@ -684,6 +685,13 @@ function loadDb() {
         dbao.models = DEFAULT_VENDORS.find(v => v.id === 'doubao').models;
         try { fs.writeFileSync(DATA_PATH, JSON.stringify(data, null, 2), 'utf8'); } catch {}
       }
+      // 迁移：阿里厂商切到千问AI平台当前模型（移除百炼旧名）
+      const ali = data.vendors.find(v => v.id === 'alibaba');
+      const retiredAli = new Set(['qwen-turbo', 'qwq-plus', 'qwen-max', 'qwen-plus', 'qwen3-coder-plus']);
+      if (ali && ali.models?.some(m => retiredAli.has(m))) {
+        ali.models = DEFAULT_VENDORS.find(v => v.id === 'alibaba').models;
+        try { fs.writeFileSync(DATA_PATH, JSON.stringify(data, null, 2), 'utf8'); } catch {}
+      }
     }
     if (!data.usage || typeof data.usage !== 'object') data.usage = {};
     if (!Array.isArray(data.tokenLogs)) data.tokenLogs = [];
@@ -726,7 +734,7 @@ const OPENAI_STYLE_VENDORS = {
   deepseek: { base: 'https://api.deepseek.com', path: '/v1/chat/completions' },
   moonshot: { base: 'https://api.moonshot.cn', path: '/v1/chat/completions' },
   zhipu: { base: 'https://open.bigmodel.cn/api/paas/v4', path: '/chat/completions' },
-  alibaba: { base: 'https://dashscope.aliyuncs.com/compatible-mode', path: '/v1/chat/completions' },
+  alibaba: { base: 'https://maas.qianwenaiapi.com/compatible-mode', path: '/v1/chat/completions' },
   doubao: { base: 'https://ark.cn-beijing.volces.com/api/v3', path: '/chat/completions' },
   ollama: { base: process.env.OLLAMA_BASE_URL || 'http://localhost:11434', path: '/v1/chat/completions' },
   vllm:   { base: process.env.VLLM_BASE_URL   || 'http://localhost:8000', path: '/v1/chat/completions' },
@@ -738,81 +746,13 @@ const DEFAULT_VENDORS = [
   { id: 'anthropic', name: 'Anthropic', region: 'US', models: ['claude-sonnet-4-6', 'claude-opus-4-8', 'claude-haiku-4-5', 'claude-sonnet-4-5'] },
   { id: 'google', name: 'Google', region: 'US', models: ['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-2.5-flash-lite'] },
   { id: 'deepseek', name: 'DeepSeek (深度求索)', region: 'CN', models: ['deepseek-v4-pro', 'deepseek-v4-flash', 'deepseek-chat', 'deepseek-reasoner'] },
-  { id: 'alibaba', name: 'Alibaba (阿里)', region: 'CN', models: ['qwen-max', 'qwen-plus', 'qwen-turbo', 'qwq-plus', 'qwen3-coder-plus'] },
+  { id: 'alibaba', name: 'Alibaba (阿里)', region: 'CN', models: ['qwen3.8-max', 'qwen3.7-plus', 'qwen3.8-flash'] },
   { id: 'zhipu', name: 'Zhipu (智谱)', region: 'CN', models: ['glm-5.1', 'glm-5', 'glm-4-plus', 'glm-4'] },
   { id: 'doubao', name: 'Doubao (豆包)', region: 'CN', models: ['doubao-seed-1.6', 'doubao-seed-1.6-lite', 'doubao-seed-code', 'doubao-1.5-pro-32k', 'doubao-pro-128k'] },
   { id: 'moonshot', name: 'Moonshot (月之暗面)', region: 'CN', models: ['kimi-k2.6', 'kimi-k2.5', 'moonshot-v1-128k'] },
   { id: 'ollama', name: 'Ollama (本地)', region: 'LOCAL', models: ['llama3.3', 'qwen2.5', 'deepseek-r1', 'codellama', 'mistral', 'gemma2'] },
   { id: 'vllm', name: 'vLLM (本地)', region: 'LOCAL', models: ['自定义模型'] },
 ];
-
-/**
- * 将前端展示用模型名映射为各平台常用 API 模型 id。
- * @param {string} vendor
- * @param {string} model
- */
-function resolveApiModel(vendor, model) {
-  const m = (model || '').trim();
-  if (vendor === 'openai') {
-    if (/gpt-4\.1(?![-\w])/i.test(m)) return 'gpt-4.1';
-    if (/4\.1-mini/i.test(m)) return 'gpt-4.1-mini';
-    if (/4\.1-nano/i.test(m)) return 'gpt-4.1-nano';
-    if (/gpt-4o/i.test(m)) return 'gpt-4o';
-    if (/o4-mini/i.test(m)) return 'o4-mini';
-    return 'gpt-4.1-mini';
-  }
-  if (vendor === 'deepseek') {
-    if (/v4-pro/i.test(m)) return 'deepseek-v4-pro';
-    if (/v4-flash/i.test(m)) return 'deepseek-v4-flash';
-    if (/reasoner/i.test(m)) return 'deepseek-reasoner';
-    return 'deepseek-chat';
-  }
-  if (vendor === 'moonshot') {
-    if (/k2\.6/i.test(m)) return 'kimi-k2.6';
-    if (/k2\.5/i.test(m)) return 'kimi-k2.5';
-    if (/128k/i.test(m)) return 'moonshot-v1-128k';
-    return 'kimi-k2.6';
-  }
-  if (vendor === 'zhipu') {
-    if (/5\.1/i.test(m)) return 'glm-5.1';
-    if (/glm-5(?!\.)/i.test(m)) return 'glm-5';
-    if (/4-plus/i.test(m)) return 'glm-4-plus';
-    return 'glm-4';
-  }
-  if (vendor === 'alibaba') {
-    if (/qwen-max/i.test(m)) return 'qwen-max';
-    if (/qwen-plus/i.test(m)) return 'qwen-plus';
-    if (/qwq/i.test(m)) return 'qwq-plus';
-    if (/coder/i.test(m)) return 'qwen3-coder-plus';
-    return 'qwen-turbo';
-  }
-  if (vendor === 'anthropic') {
-    if (/opus/i.test(m)) return 'claude-opus-4-8';
-    if (/haiku/i.test(m)) return 'claude-haiku-4-5';
-    if (/sonnet.*4-5|4\.5/i.test(m)) return 'claude-sonnet-4-5';
-    return 'claude-sonnet-4-6';
-  }
-  if (vendor === 'google') {
-    if (/2\.5.*pro/i.test(m)) return 'gemini-2.5-pro';
-    if (/2\.5.*lite|lite/i.test(m)) return 'gemini-2.5-flash-lite';
-    return 'gemini-2.5-flash';
-  }
-  if (vendor === 'doubao') {
-    // 支持用户直接填写接入点 ID（ep-xxxxx）
-    if (/^ep-/i.test(m)) return m;
-    if (/seed-1\.6(?![-\w])/i.test(m)) return 'doubao-seed-1.6';
-    if (/seed.*1\.6.*lite|seed-1\.6-lite/i.test(m)) return 'doubao-seed-1.6-lite';
-    if (/seed.*code/i.test(m)) return 'doubao-seed-code';
-    if (/1\.5.*pro.*32k/i.test(m)) return 'doubao-1.5-pro-32k';
-    if (/128k/i.test(m)) return 'doubao-pro-128k';
-    return m || 'doubao-seed-1.6';
-  }
-  // 本地模型（Ollama / vLLM / LocalAI）: 直接透传模型名
-  if (['ollama', 'vllm', 'localai'].includes(vendor)) {
-    return m || 'llama3.3';
-  }
-  return m.replace(/\s*\(.*?\)\s*/g, '').trim() || 'gpt-4.1-mini';
-}
 
 /**
  * @param {string} baseUrl
@@ -844,12 +784,10 @@ const MODEL_PRICING = {
   'deepseek-v4-flash':  { input: 0.14, output: 0.14 },
   'deepseek-chat':      { input: 0.27, output: 1.10 },
   'deepseek-reasoner':  { input: 0.55, output: 2.19 },
-  // Alibaba Qwen
-  'qwen-max':           { input: 2.40, output: 9.60 },
-  'qwen-plus':          { input: 0.80, output: 2.00 },
-  'qwen-turbo':         { input: 0.30, output: 0.60 },
-  'qwq-plus':           { input: 0.80, output: 2.00 },
-  'qwen3-coder-plus':   { input: 0.80, output: 2.00 },
+  // Alibaba / 千问AI平台 Qwen（元 / 百万 tokens，官方标价）
+  'qwen3.8-max':        { input: 12.00, output: 36.00 },
+  'qwen3.7-plus':       { input: 1.60, output: 6.40 },
+  'qwen3.8-flash':      { input: 0.80, output: 2.70 },
   // Zhipu GLM
   'glm-5.1':     { input: 0.50, output: 0.50 },
   'glm-5':       { input: 0.50, output: 0.50 },
@@ -1731,7 +1669,7 @@ app.post('/api/user/history', (req, res) => {
 /** 管理员「测试 Key」：真实探测各兼容接口 */
 const TEST_KEY_MODEL = {
   openai: 'gpt-4.1-mini', anthropic: 'claude-haiku-4-5', google: 'gemini-2.5-flash',
-  deepseek: 'deepseek-chat', alibaba: 'qwen-turbo', zhipu: 'glm-4',
+  deepseek: 'deepseek-chat', alibaba: 'qwen3.8-flash', zhipu: 'glm-4',
   doubao: 'doubao-seed-1.6-lite', moonshot: 'moonshot-v1-128k',
 };
 app.post('/api/admin/test-key', requireAdmin, async (req, res) => {
