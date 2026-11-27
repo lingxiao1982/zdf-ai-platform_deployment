@@ -62,3 +62,17 @@ export function normalizePublicBase(raw) {
   if (!s.startsWith('/')) s = `/${s}`;
   return s.replace(/\/+$/, '');
 }
+
+/**
+ * 解析请求体中的 AI Credit 消耗。
+ * 显式传入 0 必须记为 0（不可被 `Number(x) || 1` 强制成 1）；
+ * 缺失或非法值默认 1，保持旧客户端兼容。
+ * @param {unknown} raw
+ * @returns {number}
+ */
+export function parseCreditCost(raw) {
+  if (raw === undefined || raw === null || raw === '') return 1;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return 1;
+  return Math.max(0, n);
+}

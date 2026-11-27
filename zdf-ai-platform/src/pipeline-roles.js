@@ -14,6 +14,9 @@ export const ROLE_DISABLED_VENDOR = '__disabled__';
 /** 推理过程/结果中标记已跳过的文案 */
 export const SKIPPED_LABEL = '已跳过';
 
+/** final 为空串时结果区占位文案 */
+export const EMPTY_FINAL_LABEL = '（本次未生成最终文本）';
+
 /**
  * 判断角色是否已配置（启用且选定厂商与模型）。
  * @param {RoleConfig | null | undefined} config
@@ -152,4 +155,42 @@ export function pickFinalResult(results, plan) {
     if (typeof text === 'string') last = text;
   }
   return last;
+}
+
+/**
+ * 是否展示流水线结果外壳（含运行中 / 完成态 / 已有 A 输出）。
+ * 必须纳入 showComplete：否则 A 与 final 皆为空串时会出现空白完成屏。
+ * @param {{ isRunning?: boolean, showComplete?: boolean, stageA?: unknown }} flags
+ * @returns {boolean}
+ */
+export function shouldShowResultShell({ isRunning, showComplete, stageA } = {}) {
+  return Boolean(isRunning || showComplete || stageA);
+}
+
+/**
+ * 完成态是否渲染最终结果区与步骤面板。
+ * 旧逻辑用 Boolean(final) 会把 final==='' 误判为未完成。
+ * @param {boolean} showComplete
+ * @param {unknown} finalText
+ * @returns {boolean}
+ */
+export function shouldShowCompletedViews(showComplete, finalText) {
+  return Boolean(showComplete) && typeof finalText === 'string';
+}
+
+/**
+ * 按执行计划分配各角色 Credit：仅最后一个实际执行角色记流水线总额，其余为 0。
+ * @param {Array<{ id: string, action: 'run' | 'skip' }>} plan
+ * @param {number} [pipelineCost=5]
+ * @returns {Record<string, number>}
+ */
+export function pipelineRoleCreditCosts(plan, pipelineCost = 5) {
+  const billableRoleId = [...(plan || [])].reverse().find((s) => s.action === 'run')?.id;
+  /** @type {Record<string, number>} */
+  const costs = {};
+  for (const step of plan || []) {
+    if (step.action !== 'run') continue;
+    costs[step.id] = step.id === billableRoleId ? pipelineCost : 0;
+  }
+  return costs;
 }

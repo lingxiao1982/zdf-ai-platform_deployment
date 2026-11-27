@@ -21,6 +21,7 @@ import {
 import {
   ROLE_DISABLED_VENDOR,
   SKIPPED_LABEL,
+  EMPTY_FINAL_LABEL,
   isRoleConfigured,
   getUnconfiguredOptionalRoles,
   formatUnconfiguredReminder,
@@ -31,6 +32,8 @@ import {
   buildRoleCPrompt,
   buildRoleDPrompt,
   pickFinalResult,
+  shouldShowResultShell,
+  shouldShowCompletedViews,
 } from './pipeline-roles.js';
 
 const ROLES = [
@@ -2274,7 +2277,7 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, onUpdate
                   </div>
                 </div>
               )}
-              { (isRunning || results.A) && (
+              { shouldShowResultShell({ isRunning, showComplete, stageA: results.A }) && (
                 <div className="max-w-4xl mx-auto">
                   <div className="bg-white border border-gray-200 rounded-3xl shadow-lg overflow-hidden">
                     <div className="flex border-b border-gray-100 bg-gray-50">
@@ -2282,10 +2285,12 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, onUpdate
                       <button onClick={()=>setResultTab('steps')} className={`px-6 py-4 text-sm font-bold ${resultTab==='steps'?'border-b-2 border-indigo-600 text-indigo-600':'text-gray-500'}`}>推理过程</button>
                     </div>
                     <div className="p-8">
-                      {isRunning && !results.final && <PipelineAnimation currentStep={currentStep} configs={configs} results={results} vendors={vendors} isComplete={false} />}
-                      {showComplete && results.final && resultTab==='final' && <PipelineAnimation currentStep={null} configs={configs} results={results} vendors={vendors} isComplete={true} />}
-                      {results.final && resultTab==='final' && (
-                        <div className="text-gray-800 leading-relaxed whitespace-pre-wrap">{results.final}
+                      {isRunning && !showComplete && <PipelineAnimation currentStep={currentStep} configs={configs} results={results} vendors={vendors} isComplete={false} />}
+                      {shouldShowCompletedViews(showComplete, results.final) && resultTab==='final' && <PipelineAnimation currentStep={null} configs={configs} results={results} vendors={vendors} isComplete={true} />}
+                      {shouldShowCompletedViews(showComplete, results.final) && resultTab==='final' && (
+                        <div className={`leading-relaxed whitespace-pre-wrap ${results.final ? 'text-gray-800' : 'text-gray-400 italic'}`}>
+                          {results.final || EMPTY_FINAL_LABEL}
+                          {results.final ? (
                           <div className="mt-8 pt-4 border-t border-gray-100 flex flex-wrap gap-2">
                             <button onClick={()=>handleDownload('doc')} className="px-3 py-1.5 bg-indigo-50 text-indigo-600 rounded text-xs font-bold"><Download size={14} className="inline mr-1"/>Word</button>
                             <button onClick={()=>handleDownload('txt')} className="px-3 py-1.5 bg-indigo-50 text-indigo-600 rounded text-xs font-bold"><Download size={14} className="inline mr-1"/>TXT</button>
@@ -2294,9 +2299,10 @@ const UserApp = ({ auth, onLogout, isTestMode, dbKeys, onSwitchToAdmin, onUpdate
                             <button onClick={()=>handleDownload('pdf')} className="px-3 py-1.5 bg-red-50 text-red-600 rounded text-xs font-bold"><Download size={14} className="inline mr-1"/>PDF</button>
                             <button onClick={handleShare} className="px-3 py-1.5 bg-gray-50 text-gray-600 rounded text-xs font-bold"><Share2 size={14} className="inline mr-1"/>复制</button>
                           </div>
+                          ) : null}
                         </div>
                       )}
-                      {results.final && resultTab==='steps' && (
+                      {shouldShowCompletedViews(showComplete, results.final) && resultTab==='steps' && (
                         <div className="space-y-4">
                           {ROLES.map(r => {
                             const wasSkipped = Boolean(results.skipped?.[r.id]);

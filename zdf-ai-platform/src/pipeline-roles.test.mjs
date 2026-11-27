@@ -5,6 +5,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   ROLE_DISABLED_VENDOR,
+  EMPTY_FINAL_LABEL,
   isRoleConfigured,
   getUnconfiguredOptionalRoles,
   formatUnconfiguredReminder,
@@ -15,6 +16,9 @@ import {
   buildRoleCPrompt,
   buildRoleDPrompt,
   pickFinalResult,
+  shouldShowResultShell,
+  shouldShowCompletedViews,
+  pipelineRoleCreditCosts,
 } from './pipeline-roles.js';
 
 const ROLES = [
@@ -150,5 +154,57 @@ describe('pipeline plan / pass-through', () => {
       D: enabled('d', '1'),
     });
     assert.equal(pickFinalResult({ A: 'a', B: '', C: '', D: 'final-d' }, plan), 'final-d');
+  });
+
+  it('pickFinalResult can be empty string when last run role is empty', () => {
+    const plan = buildPipelinePlan({
+      A: enabled('a', '1'),
+      B: disabled(),
+      C: disabled(),
+      D: disabled(),
+    });
+    assert.equal(pickFinalResult({ A: '', B: '', C: '', D: '' }, plan), '');
+  });
+});
+
+describe('empty final UI gates', () => {
+  it('shows result shell when showComplete even if A and final are empty', () => {
+    assert.equal(shouldShowResultShell({ isRunning: false, showComplete: true, stageA: '' }), true);
+    assert.equal(shouldShowResultShell({ isRunning: false, showComplete: false, stageA: '' }), false);
+    assert.equal(shouldShowResultShell({ isRunning: true, showComplete: false, stageA: '' }), true);
+  });
+
+  it('renders completed views when final is empty string (old Boolean(final) gate failed)', () => {
+    // 旧逻辑等价于 showComplete && final —— 会在 final==='' 时隐藏完成态与步骤面板
+    const legacyGate = (showComplete, final) => Boolean(showComplete && final);
+    assert.equal(legacyGate(true, ''), false);
+
+    assert.equal(shouldShowCompletedViews(true, ''), true);
+    assert.equal(shouldShowCompletedViews(true, '有内容'), true);
+    assert.equal(shouldShowCompletedViews(false, ''), false);
+    assert.equal(shouldShowCompletedViews(false, '有内容'), false);
+    assert.ok(EMPTY_FINAL_LABEL.length > 0);
+  });
+});
+
+describe('pipeline role credit costs', () => {
+  it('bills only the last run role for full four-role pipeline', () => {
+    const plan = buildPipelinePlan({
+      A: enabled('a', '1'),
+      B: enabled('b', '1'),
+      C: enabled('c', '1'),
+      D: enabled('d', '1'),
+    });
+    assert.deepEqual(pipelineRoleCreditCosts(plan, 5), { A: 0, B: 0, C: 0, D: 5 });
+  });
+
+  it('bills only C when A+C run and B/D are skipped', () => {
+    const plan = buildPipelinePlan({
+      A: enabled('a', '1'),
+      B: disabled(),
+      C: enabled('c', '1'),
+      D: disabled(),
+    });
+    assert.deepEqual(pipelineRoleCreditCosts(plan, 5), { A: 0, C: 5 });
   });
 });

@@ -31,6 +31,7 @@ import {
   resetCodeMatches,
   normalizePublicBase,
   timingSafeEqualStr,
+  parseCreditCost,
 } from './security-utils.js';
 import { resolveApiModel } from './vendor-resolve.js';
 
@@ -1704,7 +1705,7 @@ app.post('/api/ai/generate', generateLimiter, async (req, res) => {
   let systemPrompt = req.body?.systemPrompt ?? '';
   const dispatch = req.body?.dispatch || null;
   const userId = req.userId || '';
-  const creditCost = Math.max(0, Number(req.body?.creditCost) || 1);
+  const creditCost = parseCreditCost(req.body?.creditCost);
 
   // 如果是终审角色 D，注入策略系统提示词
   if (dispatch?.roleId === 'D') {

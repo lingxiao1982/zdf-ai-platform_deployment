@@ -7,6 +7,7 @@ import {
   timingSafeEqualStr,
   generateOAuthState,
   oauthStateCookieName,
+  parseCreditCost,
 } from './security-utils.js';
 
 describe('security-utils (no HTTP server)', () => {
@@ -67,6 +68,36 @@ describe('security-utils (no HTTP server)', () => {
     it('timingSafeEqualStr rejects different lengths without throwing', () => {
       assert.equal(timingSafeEqualStr('ab', 'a'), false);
       assert.equal(timingSafeEqualStr('ab', 'ab'), true);
+    });
+  });
+
+  describe('parseCreditCost', () => {
+    it('keeps explicit 0 (must not coerce to 1)', () => {
+      assert.equal(parseCreditCost(0), 0);
+      assert.equal(parseCreditCost('0'), 0);
+    });
+
+    it('accepts positive costs and defaults missing/invalid to 1', () => {
+      assert.equal(parseCreditCost(5), 5);
+      assert.equal(parseCreditCost('5'), 5);
+      assert.equal(parseCreditCost(undefined), 1);
+      assert.equal(parseCreditCost(null), 1);
+      assert.equal(parseCreditCost(''), 1);
+      assert.equal(parseCreditCost('abc'), 1);
+      assert.equal(parseCreditCost(NaN), 1);
+    });
+
+    it('clamps negatives to 0', () => {
+      assert.equal(parseCreditCost(-3), 0);
+    });
+
+    it('sums skipped-role pipeline costs to pipeline total (not +1 per role)', () => {
+      // 四角色：前端对非计费角色传 0，旧逻辑 Number(0)||1 会多记 3 → 总计 8
+      const fourRole = [0, 0, 0, 5].map(parseCreditCost);
+      assert.equal(fourRole.reduce((a, b) => a + b, 0), 5);
+      // A+C（跳过 B/D）：旧逻辑会把 A 的 0 记成 1 → 总计 6
+      const aPlusC = [0, 5].map(parseCreditCost);
+      assert.equal(aPlusC.reduce((a, b) => a + b, 0), 5);
     });
   });
 });
