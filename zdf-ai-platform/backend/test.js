@@ -157,6 +157,114 @@ describe('ZDF.AI Backend API Tests', { concurrency: false }, () => {
     });
   });
 
+  describe('AI Generate billing integrity (server-authoritative)', () => {
+    /** 共用一名计费探针用户，避免打满 registerLimiter(5/min) */
+    let billingToken = '';
+
+    async function usageCredits(token) {
+      const { status, data } = await api('/user/usage', { token });
+      assert.equal(status, 200);
+      return data.today?.credits || 0;
+    }
+
+    async function generate(token, body) {
+      return api('/ai/generate', {
+        method: 'POST',
+        token,
+        body: { prompt: 'billing probe', systemPrompt: 'ok', ...body },
+      });
+    }
+
+    it('registers one billing probe user', async () => {
+      const username = `bill_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
+      const { status, data } = await api('/auth/register', {
+        method: 'POST',
+        body: { username, password: 'test1234', name: 'Billing Probe' },
+      });
+      assert.equal(status, 200);
+      assert.ok(data.token);
+      billingToken = data.token;
+    });
+
+    it('spoofed B with creditCost 0 still bills without a pipeline pass', async () => {
+      assert.ok(billingToken);
+      const before = await usageCredits(billingToken);
+      const { status, data } = await generate(billingToken, {
+        creditCost: 0,
+        dispatch: { roleId: 'B', vendor: 'deepseek', model: 'deepseek-chat', mode: 'platform' },
+      });
+      assert.equal(status, 200);
+      assert.equal(data.meta?.creditCost, 5);
+      const after = await usageCredits(billingToken);
+      assert.equal(after - before, 5);
+    });
+
+    it('client creditCost 0 / negative / oversized cannot under-bill role A', async () => {
+      assert.ok(billingToken);
+      const before = await usageCredits(billingToken);
+
+      const zero = await generate(billingToken, {
+        creditCost: 0,
+        dispatch: { roleId: 'A', vendor: 'deepseek', model: 'deepseek-chat', mode: 'platform' },
+      });
+      assert.equal(zero.status, 200);
+      assert.equal(zero.data.meta?.creditCost, 5);
+
+      const neg = await generate(billingToken, {
+        creditCost: -7,
+        dispatch: { roleId: 'A', vendor: 'deepseek', model: 'deepseek-chat', mode: 'platform' },
+      });
+      assert.equal(neg.status, 200);
+      assert.equal(neg.data.meta?.creditCost, 5);
+
+      const huge = await generate(billingToken, {
+        creditCost: 999,
+        dispatch: { roleId: 'A', vendor: 'deepseek', model: 'deepseek-chat', mode: 'platform' },
+      });
+      assert.equal(huge.status, 200);
+      assert.equal(huge.data.meta?.creditCost, 5);
+
+      const after = await usageCredits(billingToken);
+      assert.equal(after - before, 15);
+    });
+
+    it('honest four-role pipeline totals 5 credits', async () => {
+      assert.ok(billingToken);
+      const before = await usageCredits(billingToken);
+      for (const roleId of ['A', 'B', 'C', 'D']) {
+        const { status, data } = await generate(billingToken, {
+          creditCost: 0,
+          dispatch: { roleId, vendor: 'deepseek', model: 'deepseek-chat', mode: 'platform' },
+          ...(roleId === 'D' ? { strategy: 'fusion' } : {}),
+        });
+        assert.equal(status, 200);
+        if (roleId === 'A') assert.equal(data.meta?.creditCost, 5);
+        else assert.equal(data.meta?.creditCost, 0);
+      }
+      const after = await usageCredits(billingToken);
+      assert.equal(after - before, 5);
+    });
+
+    it('honest A+C (skip B/D) totals 5 credits', async () => {
+      assert.ok(billingToken);
+      const before = await usageCredits(billingToken);
+      const a = await generate(billingToken, {
+        creditCost: 0,
+        dispatch: { roleId: 'A', vendor: 'deepseek', model: 'deepseek-chat', mode: 'platform' },
+      });
+      assert.equal(a.status, 200);
+      assert.equal(a.data.meta?.creditCost, 5);
+      const c = await generate(billingToken, {
+        creditCost: 5,
+        dispatch: { roleId: 'C', vendor: 'deepseek', model: 'deepseek-chat', mode: 'platform' },
+      });
+      assert.equal(c.status, 200);
+      assert.equal(c.data.meta?.creditCost, 0);
+      const after = await usageCredits(billingToken);
+      assert.equal(after - before, 5);
+    });
+  });
+
   describe('Password Change', () => {
     it('POST /auth/change-password with wrong old password fails', async () => {
       const { status } = await api('/auth/change-password', {

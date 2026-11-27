@@ -31,7 +31,10 @@ import {
   resetCodeMatches,
   normalizePublicBase,
   timingSafeEqualStr,
-  parseCreditCost,
+  resolveServerCreditCost,
+  PipelinePassBook,
+  PIPELINE_OPENER_ROLE,
+  PIPELINE_CONTINUATION_ROLES,
 } from './security-utils.js';
 import { resolveApiModel } from './vendor-resolve.js';
 
@@ -374,6 +377,8 @@ function requirePermission(perm) {
 const concurrencyMap = new Map();
 /** 并发等待队列 — key: userId, value: resolve[] */
 const concurrencyQueue = new Map();
+/** 流水线续跑 pass：A 计费后签发，供诚实的 B/C/D 以 0 Credit 续跑 */
+const pipelinePassBook = new PipelinePassBook();
 
 const MAX_QUEUE_SIZE = 10;
 const QUEUE_TIMEOUT_MS = 30_000;
@@ -1705,7 +1710,14 @@ app.post('/api/ai/generate', generateLimiter, async (req, res) => {
   let systemPrompt = req.body?.systemPrompt ?? '';
   const dispatch = req.body?.dispatch || null;
   const userId = req.userId || '';
-  const creditCost = parseCreditCost(req.body?.creditCost);
+  // 计费以服务端为准：完全忽略客户端 creditCost（含 0 / 负数 / 虚高）
+  const roleId = dispatch?.roleId;
+  const useRag = Boolean(req.body?.useRag);
+  const roleKey = String(roleId || '');
+  const hasPipelinePass = Boolean(userId)
+    && PIPELINE_CONTINUATION_ROLES.includes(roleKey)
+    && pipelinePassBook.hasValid(userId);
+  const creditCost = resolveServerCreditCost({ roleId, useRag, hasPipelinePass });
 
   // 如果是终审角色 D，注入策略系统提示词
   if (dispatch?.roleId === 'D') {
@@ -1788,6 +1800,13 @@ app.post('/api/ai/generate', generateLimiter, async (req, res) => {
       const cost = calcCost(apiModel || dispatch?.model, inputTokens || 0, outputTokens || 0);
       dayUsage.cost += cost;
 
+      // 流水线 pass：A 成功后签发；持 pass 的 B/C/D 零计费时消费一次
+      if (roleKey === PIPELINE_OPENER_ROLE) {
+        pipelinePassBook.open(userId);
+      } else if (hasPipelinePass && creditCost === 0) {
+        pipelinePassBook.consume(userId);
+      }
+
       // 记录 token 日志
       dbAfter.tokenLogs.push({
         ts: new Date().toISOString(),
@@ -1797,6 +1816,7 @@ app.post('/api/ai/generate', generateLimiter, async (req, res) => {
         roleId: dispatch?.roleId,
         inputTokens: inputTokens || 0,
         outputTokens: outputTokens || 0,
+        creditCost,
         cost: Math.round(cost * 1_000_000) / 1_000_000,
         stub,
       });
@@ -1835,7 +1855,7 @@ app.post('/api/ai/generate', generateLimiter, async (req, res) => {
       text,
       meta: {
         stub, vendor: dispatch?.vendor, model: dispatch?.model, roleId: dispatch?.roleId,
-        inputTokens, outputTokens, truncated: finalPrompt !== prompt,
+        inputTokens, outputTokens, creditCost, truncated: finalPrompt !== prompt,
       },
       usageWarning,
     });
