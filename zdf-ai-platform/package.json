@@ -11,7 +11,7 @@
     "preview": "vite preview",
     "start": "npm run build && npm start --prefix backend",
     "api": "npm start --prefix backend",
-    "test": "node --import ./scripts/register-jsx.mjs --test --test-force-exit src/blank-views.test.mjs"
+    "test": "node --import ./scripts/register-jsx.mjs --test --test-force-exit src/blank-views.test.mjs src/pipeline-roles.test.mjs"
   },
   "dependencies": {
     "lucide-react": "^0.344.0",

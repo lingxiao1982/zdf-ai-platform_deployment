@@ -62,3 +62,99 @@ export function normalizePublicBase(raw) {
   if (!s.startsWith('/')) s = `/${s}`;
   return s.replace(/\/+$/, '');
 }
+
+/** 服务端权威 Credit 价目（忽略客户端 creditCost） */
+export const SERVER_CREDIT_COSTS = Object.freeze({
+  single: 1,
+  pipeline: 5,
+  rag: 10,
+});
+
+/** 流水线入口角色：计费并签发短期 continuation pass */
+export const PIPELINE_OPENER_ROLE = 'A';
+
+/** 可消费 pass 的续跑角色（无有效 pass 时按流水线价计费，禁止白嫖） */
+export const PIPELINE_CONTINUATION_ROLES = Object.freeze(['B', 'C', 'D']);
+
+export const PIPELINE_PASS_MAX_CONTINUATIONS = 3;
+export const PIPELINE_PASS_TTL_MS = 15 * 60 * 1000;
+
+/**
+ * 服务端权威 Credit：完全忽略客户端 creditCost。
+ * - useRag → rag
+ * - 角色 A → pipeline（开启流水线）
+ * - B/C/D 且持有有效 pass → 0（诚实多角色合计仍为 5）
+ * - B/C/D 无 pass → pipeline（不可因客户端声称 0 而免单）
+ * - 其他/缺失角色 → single（至少 1）
+ * @param {{ roleId?: unknown, useRag?: unknown, hasPipelinePass?: boolean }} [opts]
+ * @returns {number}
+ */
+export function resolveServerCreditCost({ roleId, useRag, hasPipelinePass } = {}) {
+  if (useRag) return SERVER_CREDIT_COSTS.rag;
+  const role = String(roleId || '');
+  if (role === PIPELINE_OPENER_ROLE) return SERVER_CREDIT_COSTS.pipeline;
+  if (PIPELINE_CONTINUATION_ROLES.includes(role)) {
+    return hasPipelinePass ? 0 : SERVER_CREDIT_COSTS.pipeline;
+  }
+  return SERVER_CREDIT_COSTS.single;
+}
+
+/**
+ * 内存中的流水线 continuation pass（单进程；与并发队列同级）。
+ * A 成功计费后签发；B/C/D 在 TTL 内最多消费 3 次 0 分计费。
+ */
+export class PipelinePassBook {
+  /**
+   * @param {{ ttlMs?: number, maxContinuations?: number, now?: () => number }} [opts]
+   */
+  constructor({
+    ttlMs = PIPELINE_PASS_TTL_MS,
+    maxContinuations = PIPELINE_PASS_MAX_CONTINUATIONS,
+    now = () => Date.now(),
+  } = {}) {
+    /** @type {Map<string, { expiresAt: number, left: number }>} */
+    this._passes = new Map();
+    this.ttlMs = ttlMs;
+    this.maxContinuations = maxContinuations;
+    this.now = now;
+  }
+
+  /**
+   * @param {string} userId
+   * @returns {boolean}
+   */
+  hasValid(userId) {
+    if (!userId) return false;
+    const p = this._passes.get(userId);
+    if (!p) return false;
+    if (this.now() > p.expiresAt || p.left <= 0) {
+      this._passes.delete(userId);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * @param {string} userId
+   */
+  open(userId) {
+    if (!userId) return;
+    this._passes.set(userId, {
+      expiresAt: this.now() + this.ttlMs,
+      left: this.maxContinuations,
+    });
+  }
+
+  /**
+   * 消费一次 continuation；无效时返回 false。
+   * @param {string} userId
+   * @returns {boolean}
+   */
+  consume(userId) {
+    if (!this.hasValid(userId)) return false;
+    const p = this._passes.get(userId);
+    p.left -= 1;
+    if (p.left <= 0) this._passes.delete(userId);
+    return true;
+  }
+}
